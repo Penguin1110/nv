@@ -1,0 +1,7 @@
+torch
+transformers
+accelerate
+pandas
+numpy
+scikit-learn
+pyarrow
