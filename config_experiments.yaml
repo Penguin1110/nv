@@ -1,0 +1,82 @@
+# MVP Configuration — Experiment A (Same-Family)
+#
+# Every key below is actually read by core_prediction.py / difficulty_baseline.py
+# / precedence_check.py — verified by grepping config[...] usage across all
+# three modules. Nothing here is aspirational; see EXPERIMENT.md
+# "Stage 3" for what still needs to be collected before this is a full run.
+
+# ----------------------------------------------------------------------------
+# MODELS (human reference — only `weak.name` is actually read by code; it
+# selects data/traces_{name}.parquet. `data.s_model_label` below is what
+# actually drives which rows of s_correctness_path count as S.)
+# ----------------------------------------------------------------------------
+models:
+  weak:
+    name: "Qwen3.5-4B"        # used to build the traces_path below
+    path: "Qwen/Qwen3.5-4B"   # HF repo id, for extract_all_layers.py (run locally, needs hidden states)
+  strong:
+    openrouter_model: "qwen/qwen3.5-27b"  # slug for run_s_inference.py --model; only correctness is needed, called via API
+
+# ----------------------------------------------------------------------------
+# DATA — column names match what prepare_pool_data.py / extract_all_layers.py
+# already produce. See DATA_CHECKLIST.md for full schema + validation snippets.
+# ----------------------------------------------------------------------------
+data:
+  queries_path: "data/queries.jsonl"               # {qid, query, ground_truth}
+  traces_path: "data/traces_{model}.parquet"        # {qid, correct, hidden_all_layers, ...}
+
+  # S correctness — produced by run_s_inference.py (calls S via OpenRouter,
+  # no local GPU needed for S). Single-model shape: qid, sample_idx, model, correct.
+  s_correctness_path: "data/s_correctness_qwen3.5-27b.parquet"
+  s_model_label: "qwen/qwen3.5-27b"   # must match run_s_inference.py's --model exactly
+
+# ----------------------------------------------------------------------------
+# STEP 1: Core Prediction (core_prediction.py)
+# ----------------------------------------------------------------------------
+core_prediction:
+  # Fraction of layers (from the embedding output) used as the "early trace".
+  # 0.25 = first quarter of layers only. Single scalar — the pipeline trains
+  # one probe per run; to compare fractions, change this and rerun.
+  prefix_fraction: 0.25
+
+  test_fraction: 0.2       # held-out fraction for AUC evaluation (GroupShuffleSplit by qid)
+  random_state: 42
+
+# ----------------------------------------------------------------------------
+# STEP 2: Difficulty Baseline (difficulty_baseline.py)
+# ----------------------------------------------------------------------------
+difficulty_baseline:
+  pass_at_k: [1]            # pass@1 is the only baseline actually computed/used
+  n_bins: 5                 # target number of difficulty bins (rank-based qcut;
+                             # may yield fewer if too few distinct qids)
+
+# ----------------------------------------------------------------------------
+# STEP 3: Precedence / Leakage Control (precedence_check.py)
+# ----------------------------------------------------------------------------
+precedence_check:
+  # Master switch. Requires "logits_per_step" + "answer_token_id" columns in
+  # the W traces (not produced by extract_all_layers.py today — see
+  # DATA_CHECKLIST.md). If absent, the module reports status=insufficient_data
+  # regardless of this flag. Use run_mvp.py --skip-precedence to silence Step 3.
+  enabled: true
+
+# ----------------------------------------------------------------------------
+# GO / NO-GO THRESHOLDS
+# ----------------------------------------------------------------------------
+experiment_a:
+  min_w_wrong_samples: 50        # abort Step 1 if fewer W✗ rows than this
+  min_cell_w_wrong_s_wrong: 20   # warn if the W✗S✗ (shared-basin) cell is smaller
+  min_auc_over_baseline: 0.05    # Step 2 must beat baseline AUC by at least this much (in addition to p<0.05)
+
+# ----------------------------------------------------------------------------
+# STATISTICS
+# ----------------------------------------------------------------------------
+statistics:
+  min_cell_size: 10          # warn if either 2x2 cell (W✗S✗ / W✗S✓) is smaller
+  ci_resamples: 10000        # bootstrap resamples for the AUC 95% CI
+
+# ----------------------------------------------------------------------------
+# OUTPUT
+# ----------------------------------------------------------------------------
+output:
+  results_dir: "results/"

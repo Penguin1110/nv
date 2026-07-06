@@ -5,3 +5,7 @@ pandas
 numpy
 scikit-learn
 pyarrow
+pyyaml
+scipy
+requests
+python-dotenv

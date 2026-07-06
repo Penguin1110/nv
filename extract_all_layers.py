@@ -15,7 +15,7 @@
 
 用法：
   python extract_all_layers.py \
-      --model Qwen/Qwen3-4B-Instruct \
+      --model Qwen/Qwen3.5-4B \
       --queries data/queries.jsonl \
       --out data/all_layers_4b.parquet \
       --token-pos last --limit 30
