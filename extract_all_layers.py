@@ -32,11 +32,13 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-def extract_choice_letter(text: str):
+def extract_choice_letter(text):
     """
     找獨立字母 A-J，但排除 "I"——它同時也是英文代名詞
     ("I'm not sure" 會被誤判成選了選項 I)。
     """
+    if text is None:
+        return None
     for m in re.finditer(r"\b([A-J])\b", text.strip()):
         if m.group(1) == "I":
             continue
@@ -44,13 +46,15 @@ def extract_choice_letter(text: str):
     return None
 
 
-def extract_numeric_answer(text: str):
+def extract_numeric_answer(text):
     """
     給 AIME 這類整數答案(0-999)用。優先順序：
       1. \\boxed{...} —— 數學競賽標準答案格式
       2. "answer is/answer:/final answer:" 後面接的數字
       3. 退而求其次：文字裡最後一個獨立整數
     """
+    if text is None:
+        return None
     text = text.strip()
 
     m = re.search(r"\\boxed\{(-?\d+)\}", text)
@@ -66,6 +70,8 @@ def extract_numeric_answer(text: str):
 
 
 def score_answer(generated_text: str, ground_truth: str, answer_type: str = "letter") -> int:
+    if ground_truth is None:
+        return 0
     if answer_type == "numeric":
         pred = extract_numeric_answer(generated_text)
         if pred is None:

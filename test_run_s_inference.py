@@ -30,6 +30,17 @@ def _fake_response(status_code, content=None, text=""):
     return resp
 
 
+def _fake_message_response(status_code, message, finish_reason=None):
+    """給需要精確控制 message dict(例如 content=None 但有 reasoning_content)的測試用。"""
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.text = ""
+    resp.json.return_value = {
+        "choices": [{"message": message, "finish_reason": finish_reason}]
+    }
+    return resp
+
+
 class TestScoring(unittest.TestCase):
     def test_extract_choice_letter(self):
         self.assertEqual(rsi.extract_choice_letter("The answer is B."), "B")
@@ -62,6 +73,18 @@ class TestScoring(unittest.TestCase):
             rsi.score_answer("first I tried 99 but the real answer is \\boxed{150}", "150", "numeric"), 1
         )
 
+    def test_none_generated_text_does_not_crash(self):
+        # Regression: OpenRouter can return content=None (e.g. truncated reasoning
+        # model output) — extraction/scoring must degrade to "no answer", not raise.
+        self.assertIsNone(rsi.extract_choice_letter(None))
+        self.assertIsNone(rsi.extract_numeric_answer(None))
+        self.assertEqual(rsi.score_answer(None, "150", "numeric"), 0)
+        self.assertEqual(rsi.score_answer(None, "A", "letter"), 0)
+
+    def test_none_ground_truth_does_not_crash(self):
+        self.assertEqual(rsi.score_answer("\\boxed{150}", None, "numeric"), 0)
+        self.assertEqual(rsi.score_answer("The answer is A", None, "letter"), 0)
+
 
 class TestCallOpenRouter(unittest.TestCase):
     def test_success(self):
@@ -76,6 +99,22 @@ class TestCallOpenRouter(unittest.TestCase):
             with patch("run_s_inference.time.sleep"):  # skip real backoff delay in test
                 text = rsi.call_openrouter("key", "qwen/qwen3.5-27b", "q", 0.7, 512, 30.0, 3)
         self.assertEqual(text, "Answer: B")
+
+    def test_null_content_falls_back_to_reasoning_content(self):
+        # Regression for the real failure seen against qwen3.5-27b: content is null,
+        # actual output ended up in reasoning_content instead.
+        resp = _fake_message_response(
+            200, {"content": None, "reasoning_content": "I worked it out: \\boxed{116}"}
+        )
+        with patch("run_s_inference.requests.post", return_value=resp):
+            text = rsi.call_openrouter("key", "m", "q", 0.7, 512, 30.0, 3)
+        self.assertEqual(text, "I worked it out: \\boxed{116}")
+
+    def test_null_content_and_no_reasoning_raises_clear_error(self):
+        resp = _fake_message_response(200, {"content": None}, finish_reason="length")
+        with patch("run_s_inference.requests.post", return_value=resp):
+            with self.assertRaisesRegex(ValueError, "max_tokens"):
+                rsi.call_openrouter("key", "m", "q", 0.7, 512, 30.0, 3)
 
     def test_exhausts_retries(self):
         with patch("run_s_inference.requests.post", return_value=_fake_response(503, text="down")):

@@ -55,13 +55,13 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 DEFAULT_MODEL = "qwen/qwen3.5-27b"
 
 
-def extract_choice_letter(text: str) -> Optional[str]:
+def extract_choice_letter(text: Optional[str]) -> Optional[str]:
     """
-    跟 extract_all_layers.py 用同一套「找獨立字母 A-J」規則，但額外排除 "I"——
-    因為 "I" 同時也是英文代名詞（"I'm not sure" 會被誤判成選了選項 I）。
-    這個誤判在 extract_all_layers.py 裡目前也存在，尚未回報/修正那邊，這裡先
-    在新程式碼中修掉，避免 S 的標籤被這個假陽性污染。
+    跟 extract_all_layers.py 用同一套「找獨立字母 A-J」規則(兩邊都修過)，但額外
+    排除 "I"——因為 "I" 同時也是英文代名詞（"I'm not sure" 會被誤判成選了選項 I）。
     """
+    if text is None:
+        return None
     for m in re.finditer(r"\b([A-J])\b", text.strip()):
         if m.group(1) == "I":
             continue
@@ -69,13 +69,17 @@ def extract_choice_letter(text: str) -> Optional[str]:
     return None
 
 
-def extract_numeric_answer(text: str) -> Optional[str]:
+def extract_numeric_answer(text: Optional[str]) -> Optional[str]:
     """
     給 AIME 這類整數答案(0-999)用。優先順序：
       1. \\boxed{...} —— 數學競賽標準答案格式，跟資料集本身 solution 欄位寫法一致
       2. "answer is/answer:/final answer:" 後面接的數字
       3. 退而求其次：文字裡最後一個獨立整數(模型通常把最終答案放在推理過程最後)
+
+    text 可能是 None(例如 API 回應被截斷、content 是空的)，直接視為抓不到答案。
     """
+    if text is None:
+        return None
     text = text.strip()
 
     m = re.search(r"\\boxed\{(-?\d+)\}", text)
@@ -90,7 +94,10 @@ def extract_numeric_answer(text: str) -> Optional[str]:
     return numbers[-1] if numbers else None
 
 
-def score_answer(generated_text: str, ground_truth: str, answer_type: str = "letter") -> int:
+def score_answer(generated_text: Optional[str], ground_truth: str, answer_type: str = "letter") -> int:
+    if ground_truth is None:
+        return 0
+
     if answer_type == "numeric":
         pred = extract_numeric_answer(generated_text)
         if pred is None:
@@ -145,7 +152,21 @@ def call_openrouter(
             choices = data.get("choices", [])
             if not choices:
                 raise ValueError(f"OpenRouter 回應沒有 choices：{data}")
-            return choices[0]["message"]["content"]
+            message = choices[0]["message"]
+            content = message.get("content")
+            if not content:
+                # 推理型模型有時把輸出放在 reasoning/reasoning_content，若還在思考中
+                # 就被 max_tokens 截斷，content 會是 null 或空字串。退而求其次抓推理欄位，
+                # 兩者都沒有的話明確報錯，不要讓 None 一路傳下去在別處炸出難懂的錯誤。
+                content = message.get("reasoning_content") or message.get("reasoning")
+            if not content:
+                finish_reason = choices[0].get("finish_reason")
+                raise ValueError(
+                    f"OpenRouter 回應沒有可用文字內容(content/reasoning 皆空，"
+                    f"finish_reason={finish_reason!r})——可能是 max_tokens 太小，"
+                    f"模型還在思考就被截斷了，試著調大 --max-tokens"
+                )
+            return content
 
         if resp.status_code in (429, 500, 502, 503, 504):
             last_error = RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")

@@ -2,19 +2,20 @@
 
 ## 老實說：現在的完整度
 
-**還沒有一條從「模型回答問題」到「分析結論」都真的跑過真實資料的完整實驗。**
+**分析層的程式碼跟邏輯都就緒且測試過，但整條線還沒有拿真實資料完整跑過一次。**
 
-- 這個開發環境**沒有 GPU**（`torch.cuda.is_available()` = False），所以「載入 Qwen3.5-4B/27B
-  真的跑題目」這件事，從頭到尾都無法在這裡執行、也從沒執行過。
 - 分析層（`core_prediction.py` / `difficulty_baseline.py` / `precedence_check.py` /
-  `run_mvp.py`）我只用 `mock_data.py` 產生的**合成假資料**測試過管線邏輯本身不會崩潰、
-  三個控制組的判斷邏輯正確；從沒有接過真實模型輸出。
-- 資料收集層（讓模型回答問題、記錄內部狀態）你原本就有 `extract_all_layers.py` /
-  `prepare_pool_data.py`，但這兩支目前只能做到「單次貪婪生成 + 存 prefill hidden
-  state」，缺兩塊本實驗要用到的東西（下面 Stage 3 詳述），需要另外寫程式碼補上，
-  目前**還沒有寫**。
+  `run_mvp.py`）用 `mock_data.py` 的合成假資料測過，管線邏輯正確、三個控制組判斷邏輯
+  也正確；但從沒接過真實模型輸出。
+- Stage 1（題目）、Stage 3 的 S 標籤腳本（`run_s_inference.py`）都寫好且測試過（mock
+  測試，不是真的打過 API），可以在有 GPU/API key 的機器上直接跑。
+- Stage 2（W 抽 hidden state）程式碼已經改好支援數字答案，但**還沒有實際跑過**——你的
+  遠端機器有 GPU（GeForce GTX 1650，4GB VRAM），但這張卡對 4B 級模型的半精度權重
+  （~8GB）偏緊，很可能需要 4-bit 量化才跑得動，沒有實測過，不能保證一定成功。
+- W 的多重採樣、逐步 logits 收集——**完全沒有程式碼**，是目前最大的缺口。
 
-下面用「實驗流程」的角度，把整條線該有的五個階段、每階段現況、每階段程式邏輯講清楚。
+已經把最新的修正 push 上 GitHub（`Penguin1110/nv` master 分支），你在遠端機器上
+`git pull` 就能拿到。
 
 ---
 
@@ -33,139 +34,159 @@
 ## 完整實驗的五個階段
 
 ```
-Stage 1     Stage 2              Stage 3                          Stage 4              Stage 5
-準備題目 →  W 回答問題+記錄狀態 →  S 標籤(OpenRouter,已寫) +        →  統計分析(3個控制) →  Go/No-Go
-                                  W 多重採樣/逐步logits(缺程式)
+Stage 1        Stage 2              Stage 3                          Stage 4              Stage 5
+準備 AIME 題 → W 回答問題+記錄狀態 →  S 標籤(OpenRouter,已寫) +        →  統計分析(3個控制) →  Go/No-Go
+                                     W 多重採樣/逐步logits(缺程式)
 ```
 
 ### Stage 1：準備題目
 
-**程式**：`prepare_pool_data.py`（既有，未修改）
-**做什麼**：從 LLMRouterBench 的 benchmark 下載包裡，讀出每一題的完整 prompt 和標準答案。
-**輸出**：`queries.jsonl`（qid, query, ground_truth）。
-**現況**：程式存在，邏輯沒問題（用 `prompt` 而非 `origin_query`，確保跟後面 hidden state
-對應的是同一份輸入）。**這次沒有實際跑過**——需要你手上有 LLMRouterBench 的下載包。
+**程式**：`prepare_aime_data.py`（新寫，已用真實資料跑過）
+**做什麼**：從 HuggingFace `AI-MO/aimo-validation-aime` 抓題目，只取 `problem`（題目文字）
+和 `answer`（0-999 整數答案），不碰 `solution`（裡面有完整解法跟 `\boxed{答案}`，混進去
+會洩漏答案）。
+**輸出**：`queries.jsonl`（qid, query, ground_truth）—— 跟原本 `prepare_pool_data.py` 的
+格式完全相容，後面的腳本不用改。
+**現況**：✅ 已實測，90 題全部正確寫出。
 
-> **這裡有一個架構決定**：LLMRouterBench 的池子裡只有小模型，沒有 Qwen3.5-27B 這種大模型
-> 的結果，所以 `prepare_pool_data.py` 原本產出的 `labels.parquet`（池內每個模型的對錯）
-> **不會拿來當 S 的標籤**，只取它的 `queries.jsonl` 部分（題目本身）。S 的標籤改由
-> Stage 3 的 `run_s_inference.py` 自己產生。
+```bash
+python3 prepare_aime_data.py --out-queries data/queries.jsonl
+```
+
+> **為什麼放棄 LLMRouterBench**：原本想用它同時拿題目跟 S 的標籤，但實測解壓後的目錄
+> 結構（`bench-release/<dataset>/...`）跟它自己的 README 寫的不一樣，且各資料集的
+> split 命名毫無規律（test/valid/hybrid/subset_500/test_1000...），也沒有解決多重採樣
+> 缺口。改用乾淨的公開 AIME dataset，題目來源單純、自己完全掌控。
+>
+> ⚠️ **只有 90 題**，比原始設計建議的「至少 200-500 題」少很多。先用來跑通整條管線；
+> 如果 W✗ 的樣本數不夠（見下方 `min_w_wrong_samples` 門檻），需要疊加其他年份的 AIME
+> 題目或換更大的資料集。
 
 ### Stage 2：弱模型（W）回答問題，同時記錄內部狀態
 
-**程式**：`extract_all_layers.py`（既有，未修改）
-**做什麼**：載入 W（例如 Qwen3.5-4B），對每一題：
+**程式**：`extract_all_layers.py`（既有腳本，這次修過）
+**做什麼**：載入 W，對每一題：
 1. 把完整 prompt 餵進去做一次 forward pass，抓「prompt 最後一個 token 位置」在**每一層**
-   的 hidden state（這是模型讀完題目、還沒開始生成任何東西那一刻的內部狀態）
-2. 接著做一次貪婪生成（`do_sample=False`），拿生成結果跟 ground_truth 比對算對錯
+   的 hidden state（模型讀完題目、還沒開始生成任何東西那一刻的內部狀態）
+2. 做一次貪婪生成（`do_sample=False`），拿生成結果跟 ground_truth 比對算對錯
 **輸出**：`traces_{model}.parquet`（qid, correct, hidden_all_layers 等欄）
-**現況**：程式存在，邏輯沒問題。**這次沒有實際跑過**（沒有 GPU，4B 模型在 CPU 上跑不動）。
 
-> **發現一個既有 bug**：判斷對錯用的 `extract_choice_letter()` 正規表達式
-> `\b([A-J])\b` 會把英文代名詞 "I"（例如生成文字裡的 "I'm not sure"）誤判成選了選項
-> I，可能讓 W 的對錯標籤被污染。這個 bug 存在於這支既有程式裡，這次沒有動它（不在授權
-> 範圍內），只在我自己新寫的 `run_s_inference.py` 裡先修掉了。你之後跑 W 之前，建議在
-> `extract_all_layers.py` 裡也套用同樣的排除邏輯。
+**這次修的東西**：
+- `extract_choice_letter()` 原本會把 "I'm not sure" 的 "I" 誤判成選了選項 I，已修掉
+- 新增 `--answer-type numeric`：AIME 答案是整數，不是選擇題字母，**這次一定要加這個參數**
+- 新增 `--max-new-tokens`：原本寫死 8 個 token（只夠選擇題答案），長推理題完全不夠，
+  改成可調參數，AIME 建議 1024 以上（沒指定會印警告提醒你）
 
-### Stage 3：取得 S 的答案（新寫的程式）+ 目前還缺的部分
+```bash
+python3 extract_all_layers.py \
+    --model <W模型的HF路徑> \
+    --queries data/queries.jsonl \
+    --out data/traces_<model>.parquet \
+    --answer-type numeric \
+    --max-new-tokens 1024
+```
 
-**S 的標籤**——`run_s_inference.py`（新增，已用 mock HTTP 回應測試過 8 個案例，
-**但沒有打過真實 OpenRouter API**）
-- 讀 `queries.jsonl`，對每一題呼叫 OpenRouter 的 Qwen3.5-27B（`qwen/qwen3.5-27b`）
-  `--n-samples` 次（預設 8 次，temperature=0.7），把每次的對錯記下來
-- 因為 S 在 Experiment A 只需要對錯、不需要 hidden state，用 API 呼叫就夠，不需要本地
-  跑 32B 的權重
+**現況**：邏輯改好、語法確認過，但**還沒有拿真實模型跑過**。你的 GPU（GTX 1650, 4GB）
+對 4B 模型的半精度權重偏緊，建議先用 `--limit 5` 小規模試跑，觀察會不會 OOM；OOM 的話
+需要加 4-bit 量化（`bitsandbytes`），目前腳本還沒支援，要跑不動再回來加。
+
+### Stage 3：取得 S 的答案 + 目前還缺的部分
+
+**S 的標籤**——`run_s_inference.py`（新寫，8→13 個 mock 測試通過，**沒打過真實 API**）
+- 讀 `queries.jsonl`，對每一題呼叫 OpenRouter 的 S 模型 `--n-samples` 次
+  （預設 8 次，temperature=0.7），把每次的對錯記下來
+- 同樣加了 `--answer-type numeric`，AIME 一定要加
+- 因為 S 只需要對錯、不需要 hidden state，用 API 呼叫就夠，不用本地跑大模型
 - 可續跑：中斷重跑會跳過已經打過的 (qid, sample_idx)
-- **正式跑之前**：先去 https://openrouter.ai/models 搜尋 "qwen3.5-27b" 確認 model slug
-  沒變，並用 `--limit 2 --n-samples 1` 小規模跑一次、人工檢查 `raw_generation` 合理再
-  跑全量
 
-**W 的多重採樣**——**還沒有程式碼**
-- `extract_all_layers.py` 目前每題只生成一次（貪婪解碼）。要估計「這題 W 答對的機率」
-  （pass@1），需要同一題用 temperature > 0 跑很多次，記錄每次的對錯。
-  沒有這個，pass@1 只會是 0 或 1，難度控制組（Stage 4 的控制 #1）就沒有意義。
-  → 需要在 `extract_all_layers.py` 的生成迴圈外面再包一層採樣迴圈，仿照
-  `run_s_inference.py` 的續跑/多樣本設計。
+```bash
+cp .env.example .env   # 填入真實的 OPENROUTER_API_KEY
+python3 run_s_inference.py \
+    --queries data/queries.jsonl \
+    --out data/s_correctness_<model>.parquet \
+    --model <OpenRouter型錄裡的slug> \
+    --answer-type numeric \
+    --n-samples 8 \
+    --limit 2   # 先小規模試跑，人工檢查 raw_generation 合理再拿掉這個參數跑全量
+```
 
-**W 的逐步 logits**——**還沒有程式碼**
-- 要驗證「W 是不是在答案生成前就已經鎖死在錯誤方向」，需要生成過程中**每一步**的
-  logits（`[num_steps, vocab_size]`），以及正確答案對應的 token id。
-  `extract_all_layers.py` 目前只存最終生成文字，完全沒有記錄這個。
-  → 需要生成時用 `output_scores=True` 之類的方式，把每步 logits 存下來。
+**W 的多重採樣**——**還沒有程式碼**。`extract_all_layers.py` 目前每題只生成一次
+（貪婪解碼）。要估計 W 的 pass@1，需要同一題用 temperature > 0 跑很多次。沒有這個，
+難度控制組（Stage 4 控制 #1）就沒有意義。→ 需要在生成迴圈外面再包一層採樣迴圈，
+仿照 `run_s_inference.py` 的續跑/多樣本設計。
 
-### Stage 4：統計分析（本次新增，用假資料測試過）
+**W 的逐步 logits**——**還沒有程式碼**。要驗證「W 是不是在答案生成前就已經鎖死在錯誤
+方向」，需要生成過程中每一步的 logits，`extract_all_layers.py` 目前只存最終生成文字。
+→ 需要生成時用 `output_scores=True` 之類的方式，把每步 logits 存下來。
+
+### Stage 4：統計分析（用假資料測試過）
 
 **程式**：`core_prediction.py` → `difficulty_baseline.py` → `precedence_check.py`，由
-`run_mvp.py` 串起來執行。
-
-這一步的**輸入**是 Stage 1+2（+3）產出的三個檔案，**完全不會去跑任何模型**，純粹是讀
-parquet/jsonl 做統計。三個子步驟：
+`run_mvp.py` 串起來執行。完全不會去跑任何模型，純粹讀 parquet/jsonl 做統計。
 
 **① 核心預測**（`core_prediction.py`）
-- 只挑「W 答錯」的題目
-- 把每一列的 hidden state 取前 `prefix_fraction`（例如 25%）的層，算平均值/標準差/最大值
-  /PCA 主成分，串成一個特徵向量
+- 只挑「W 答錯」的題目，把每一列 hidden state 取前 `prefix_fraction`（例如 25%）的層，
+  算平均值/標準差/最大值/PCA 主成分當特徵
 - 標籤：這題 S 是否也答錯（1 = 兩個都錯，是我們要找的「共享難」；0 = S 能救回來）
-- 訓一個邏輯迴歸 probe，用早期特徵預測這個標籤，算 AUC
-- **重要**：切 train/test 時是按「題目」分組切（同一題的所有樣本只會在 train 或只會在
-  test，不會兩邊都有）——因為同一題的多個樣本會共用同一個 S 標籤，如果讓同一題同時出現
-  在兩邊，等於讓 test 集偷看到答案，AUC 會虛高。我一開始沒注意到這點，用假資料測出
-  AUC=1.0 這種不合理的數字才發現，改成分組切分後降到合理的 0.5 附近。
+- 訓一個邏輯迴歸 probe 預測這個標籤，算 AUC
+- train/test 按「題目」分組切（同一題的樣本不會同時出現在兩邊）——同一題的多個樣本
+  共用同一個 S 標籤，列層級隨機切分會洩漏，AUC 會虛高（實測過：修正前 1.0，修正後
+  降到合理的 0.5 附近）
 
-**② 難度控制**（`difficulty_baseline.py`）——**這是整個實驗的命門**
-- 算每題 W 的 pass@1（有 Stage 3 的多重採樣資料才準；現在只有單次生成，pass@1 只能是
-  0，這個控制目前形同虛設）
-- 把題目按難度分成幾桶
-- 在**同一個難度桶內**，比較①的 probe 預測力，跟「單純用難度高低去猜」這個最笨的
-  baseline，誰的 AUC 比較高
-- 如果 probe 在同一難度桶內還是贏，代表 hidden state 裡有難度數字本身沒有的資訊
-  （這才是「幾何訊號有意義」的證據）；贏不了就代表只是在測難度而已
+**② 難度控制**（`difficulty_baseline.py`）——**整個實驗的命門**
+- 算每題 W 的 pass@1，按難度分桶，在**同一個難度桶內**比較 probe AUC 跟純難度 baseline
+  AUC 誰贏——贏了才算「幾何訊號有意義」，不然只是在測難度
+- 需要 Stage 3 的 W 多重採樣資料才有意義，目前這塊還缺
 
 **③ 洩漏控制**（`precedence_check.py`）
-- 檢查「模型開始鎖死在錯誤方向」這件事，是不是發生在「正確答案的 token 開始變得有競爭力」
-  之前——如果鎖死發生在答案幾乎要生成出來之後，代表訊號可能只是從已經生成的 token 洩漏
-  回來的，不是真正早期的訊號
-- **現在完全跑不了**，因為需要 Stage 3 的逐步 logits，目前沒有這份資料。程式會誠實回報
-  `insufficient_data`，不會假裝檢查通過。
+- 檢查「模型鎖死在錯誤方向」是否發生在「正確答案 token 變得有競爭力」之前
+- 需要 Stage 3 的逐步 logits，目前沒有這份資料，程式會誠實回報 `insufficient_data`
 
 ### Stage 5：Go / No-Go 判斷
 
-`run_mvp.py` 把①②③的結果彙整，寫進 `results/mvp_summary.json`：
-- ① AUC ≤ 0.5 → 直接 NO-GO（沒訊號）
+`run_mvp.py` 彙整①②③結果，寫進 `results/mvp_summary.json`：
+- ① AUC ≤ 0.5 → NO-GO（沒訊號）
 - ② probe 沒有顯著贏過難度 baseline → NO-GO（只是難度）
 - ③ 顯示可疑（答案先於鎖死出現）→ CONDITIONAL（訊號可能不乾淨）
 - 都過關 → GO，可以進到 Phase 2（跨家族模型）
 
 ---
 
-## 現在能做什麼、不能做什麼
-
-| 能做 | 不能做 |
-|---|---|
-| 用 `mock_data.py` 造假資料，驗證 Stage 4 的三個模組邏輯跑不跑得通 | 真的載入 W 跑題目（沒 GPU） |
-| 呼叫 OpenRouter 取得 S 的真實標籤（`run_s_inference.py`，需要你自己的 API key） | 驗證假說在真實資料上成不成立（W 那邊還沒有資料） |
-| 檢查 Stage 4 的程式碼邏輯是否正確（train/test 切分、分桶、AUC 計算） | W 的多重採樣、逐步 logits 收集（程式碼還沒寫） |
-
-### 快速跑一次（只驗證管線邏輯，數字沒有科學意義）
+## 在你的遠端機器上，照順序要做的事
 
 ```bash
+cd ~/nv
+git pull origin master        # 拿最新程式碼
+
 pip install -r requirements.txt
-python mock_data.py
-python run_mvp.py --skip-precedence
-cat results/mvp_summary.json
+
+# Stage 1
+python3 prepare_aime_data.py --out-queries data/queries.jsonl
+
+# Stage 3（S，先小規模試跑）
+cp .env.example .env          # 填入真實 OPENROUTER_API_KEY（若還沒設過）
+python3 run_s_inference.py --queries data/queries.jsonl \
+    --out data/s_correctness_<S模型>.parquet \
+    --model <OpenRouter slug> --answer-type numeric --limit 2
+
+# Stage 2（W，先小規模試跑，注意 4GB VRAM 可能 OOM）
+python3 extract_all_layers.py --model <W模型HF路徑> \
+    --queries data/queries.jsonl \
+    --out data/traces_<W模型>.parquet \
+    --answer-type numeric --max-new-tokens 1024 --limit 5
 ```
 
-### 真正要跑實驗，照順序要做的事
+小規模都正常後，拿掉 `--limit` 跑全量，再更新 `config_experiments.yaml` 裡的
+`data.s_model_label` 對應到你實際用的 S slug，最後跑：
 
-1. 有 LLMRouterBench 下載包 → 跑 `prepare_pool_data.py`，只取用它產出的 `queries.jsonl`
-2. `cp .env.example .env`，填入真實的 `OPENROUTER_API_KEY` → 跑 `run_s_inference.py`
-   取得 S 的標籤（先 `--limit 2 --n-samples 1` 小規模檢查一次再跑全量）
-3. 有 GPU → 跑 `extract_all_layers.py` 對 W 模型抽 hidden state（目前只有單次生成）
-4. **[待寫程式]** 幫 W 加上多重採樣（給難度 baseline 用，仿照 `run_s_inference.py` 的
-   續跑設計）
-5. **[待寫程式]** 幫 W 加上逐步 logits 收集（給洩漏控制用）
-6. 跑 `python run_mvp.py --config config_experiments.yaml`（不加 `--skip-precedence`，
-   因為屆時資料齊全，可以真的檢查洩漏）
+```bash
+python3 run_mvp.py --config config_experiments.yaml --skip-precedence
+```
+
+（`--skip-precedence` 是因為 Stage 3 的逐步 logits 還沒有程式碼收集）
+
+**還沒做、會擋住完整結果的事**：W 的多重採樣（難度 baseline 會不準）、W 的逐步 logits
+（precedence check 完全跑不了）。
 
 ---
 
@@ -173,15 +194,16 @@ cat results/mvp_summary.json
 
 | 檔案 | 欄位 | 來源 |
 |---|---|---|
-| `data/queries.jsonl` | `qid, query, ground_truth` | `prepare_pool_data.py` |
+| `data/queries.jsonl` | `qid, query, ground_truth` | `prepare_aime_data.py` |
 | `data/traces_{W模型名}.parquet` | `qid, correct, hidden_all_layers` | `extract_all_layers.py` |
-| `data/s_correctness_qwen3.5-27b.parquet` | `qid, sample_idx, model, correct` | `run_s_inference.py` |
+| `data/s_correctness_{S模型名}.parquet` | `qid, sample_idx, model, correct` | `run_s_inference.py` |
 
 `hidden_all_layers` 是巢狀 list `list[層數+1][hidden_dim]`（`.tolist()` 存出來的），
-不是 numpy array——這點跟你既有的 `sweep_layers.py` 解析方式一致。
+不是 numpy array——這點跟 `sweep_layers.py` 的解析方式一致。
 
 `config_experiments.yaml` 裡的 `data.s_model_label` 要跟 `run_s_inference.py --model`
-用的 slug 完全一致（預設都是 `qwen/qwen3.5-27b`）。
+用的 slug 完全一致。`ground_truth` 現在是 AIME 的整數字串（例如 `"116"`），不是選擇題
+字母——`--answer-type numeric` 就是為了對應這個。
 
 ---
 
@@ -189,17 +211,18 @@ cat results/mvp_summary.json
 
 | 檔案 | 屬於哪個 Stage | 狀態 |
 |---|---|---|
-| `prepare_pool_data.py` | Stage 1 | 既有，未跑過 |
-| `extract_all_layers.py` | Stage 2 | 既有，未跑過；已知 "I" 誤判 bug 未修 |
-| `sweep_layers.py` | 輔助分析（逐層掃 AUC，跟本實驗的 probe 是同一類工具） | 既有，未跑過 |
+| `prepare_aime_data.py` | Stage 1 | ✅ 已實測（90 題） |
+| `extract_all_layers.py` | Stage 2 | 邏輯修好(numeric 計分/可調 max-new-tokens/I bug)，未實測 |
+| `sweep_layers.py` | 輔助分析(逐層掃 AUC) | 既有，未跑過 |
 | `run_all_encoders.sh` | Stage 2 批次版 | 既有，未跑過 |
-| `run_s_inference.py` | Stage 3（S 標籤，OpenRouter） | 新增，8 個 mock 測試通過，**沒打過真實 API** |
-| `test_run_s_inference.py` | `run_s_inference.py` 的單元測試 | 新增 |
-| `.env` / `.env.example` | 放 `OPENROUTER_API_KEY`（`.env` 已 gitignore，只是佔位符） | 新增 |
+| `run_s_inference.py` | Stage 3（S 標籤，OpenRouter） | 13 個 mock 測試通過，**沒打過真實 API** |
+| `test_run_s_inference.py` | 上面的單元測試 | 新增 |
+| `.env` / `.env.example` | 放 `OPENROUTER_API_KEY`（`.env` 已 gitignore） | 新增 |
+| `prepare_pool_data.py` | 目前不用(LLMRouterBench 已放棄) | 目錄偵測邏輯修過，留著備用 |
 | （W 多重採樣/逐步 logits 腳本） | Stage 3（W） | **不存在，需另外寫** |
-| `core_prediction.py` | Stage 4-① | 新增，假資料測試過 |
-| `difficulty_baseline.py` | Stage 4-② | 新增，假資料測試過 |
-| `precedence_check.py` | Stage 4-③ | 新增，假資料測試過（真資料跑不了） |
-| `run_mvp.py` | Stage 4+5 協調器 | 新增，假資料測試過 |
+| `core_prediction.py` | Stage 4-① | 假資料測試過 |
+| `difficulty_baseline.py` | Stage 4-② | 假資料測試過 |
+| `precedence_check.py` | Stage 4-③ | 假資料測試過（真資料跑不了） |
+| `run_mvp.py` | Stage 4+5 協調器 | 假資料測試過 |
 | `mock_data.py` | 測試用合成資料產生器 | 新增 |
 | `config_experiments.yaml` | 全域參數設定 | 新增 |
