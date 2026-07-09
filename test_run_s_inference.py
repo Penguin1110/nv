@@ -171,6 +171,32 @@ class TestMainEndToEnd(unittest.TestCase):
         df_after = pd.read_parquet(self.out_path)
         self.assertEqual(len(df_after), 6)  # 沒有重複、也沒有新增
 
+    def test_failures_logged_to_errors_jsonl(self):
+        # Alternate success/failure so we can check both the main output and
+        # the sidecar error log end up with the right counts.
+        call_count = {"n": 0}
+
+        def flaky(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] % 2 == 0:
+                raise RuntimeError("simulated API failure")
+            return "Answer: A"
+
+        with patch("run_s_inference.call_openrouter", side_effect=flaky):
+            self._run_main(n_samples=2)  # 3 qids x 2 samples = 6 calls -> 3 ok, 3 fail
+
+        df = pd.read_parquet(self.out_path)
+        self.assertEqual(len(df), 3)
+
+        errors_path = self.out_path.with_suffix(self.out_path.suffix + ".errors.jsonl")
+        self.assertTrue(errors_path.exists())
+        with open(errors_path, encoding="utf-8") as f:
+            error_rows = [json.loads(line) for line in f]
+        self.assertEqual(len(error_rows), 3)
+        self.assertIn("simulated API failure", error_rows[0]["error"])
+        self.assertIn("qid", error_rows[0])
+        self.assertIn("sample_idx", error_rows[0])
+
     def test_missing_api_key_exits(self):
         argv = [
             "run_s_inference.py",

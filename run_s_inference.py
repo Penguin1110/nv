@@ -226,6 +226,12 @@ def main():
     if done:
         print(f"[s_infer] 已有 {len(done)} 筆 (qid, sample_idx) 結果，將跳過重跑", file=sys.stderr)
 
+    # 失敗記錄寫進獨立的 jsonl，跟主輸出檔同目錄同前綴——這樣長時間背景執行
+    # (nohup/斷線)結束後,不用翻終端機捲軸也能知道哪些 (qid, sample_idx) 失敗、
+    # 為什麼失敗,方便之後單獨重跑或人工檢查。
+    errors_path = out_path.with_suffix(out_path.suffix + ".errors.jsonl")
+    errors_file = open(errors_path, "a", encoding="utf-8")
+
     buffer_rows = []
 
     def flush(rows):
@@ -239,12 +245,16 @@ def main():
 
     total_calls = len(queries) * args.n_samples
     n_done = 0
+    n_skipped = 0
+    n_succeeded = 0
+    n_failed = 0
 
     for item in queries:
         qid = item["qid"]
         for sample_idx in range(args.n_samples):
             n_done += 1
             if (qid, sample_idx) in done:
+                n_skipped += 1
                 continue
             try:
                 gen_text = call_openrouter(
@@ -259,8 +269,14 @@ def main():
                     "correct": correct,
                     "raw_generation": gen_text,
                 })
+                n_succeeded += 1
             except Exception as e:
+                n_failed += 1
                 print(f"[s_infer] qid={qid} sample={sample_idx} 失敗：{e}", file=sys.stderr)
+                errors_file.write(json.dumps({
+                    "qid": qid, "sample_idx": sample_idx, "error": str(e),
+                }, ensure_ascii=False) + "\n")
+                errors_file.flush()
                 continue
 
             if len(buffer_rows) >= args.flush_every:
@@ -268,10 +284,22 @@ def main():
                 buffer_rows = []
 
             if n_done % 20 == 0:
-                print(f"[s_infer] 進度 {n_done}/{total_calls}", file=sys.stderr)
+                print(
+                    f"[s_infer] 進度 {n_done}/{total_calls} "
+                    f"(成功 {n_succeeded}, 失敗 {n_failed}, 跳過 {n_skipped})",
+                    file=sys.stderr,
+                )
 
     flush(buffer_rows)
-    print(f"[s_infer] 完成 {len(queries)} 題 x {args.n_samples} 次採樣", file=sys.stderr)
+    errors_file.close()
+
+    print(
+        f"[s_infer] 完成 {len(queries)} 題 x {args.n_samples} 次採樣 —— "
+        f"成功 {n_succeeded}, 失敗 {n_failed}, 跳過(已存在) {n_skipped}",
+        file=sys.stderr,
+    )
+    if n_failed > 0:
+        print(f"[s_infer] 失敗細節 → {errors_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
