@@ -38,7 +38,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import pandas as pd
 import requests
@@ -122,9 +122,12 @@ def call_openrouter(
     max_tokens: int,
     timeout: float,
     max_retries: int,
-) -> str:
+) -> Tuple[str, Optional[str]]:
     """
-    打一次 OpenRouter chat completions，回傳生成文字。
+    打一次 OpenRouter chat completions，回傳 (生成文字, finish_reason)。
+    finish_reason="length" 代表在 max_tokens 用完前被截斷，還沒真正結束推理——
+    存下來讓你之後分析時能篩掉這種「沒有機會寫出答案」的資料列，跟真正推理
+    失敗的資料分開看，不然難度/失敗訊號會被截斷雜訊污染。
     對 429/5xx 做簡單的指數退避重試；其餘錯誤直接拋出。
     """
     headers = {
@@ -153,6 +156,7 @@ def call_openrouter(
             if not choices:
                 raise ValueError(f"OpenRouter 回應沒有 choices：{data}")
             message = choices[0]["message"]
+            finish_reason = choices[0].get("finish_reason")
             content = message.get("content")
             if not content:
                 # 推理型模型有時把輸出放在 reasoning/reasoning_content，若還在思考中
@@ -160,13 +164,12 @@ def call_openrouter(
                 # 兩者都沒有的話明確報錯，不要讓 None 一路傳下去在別處炸出難懂的錯誤。
                 content = message.get("reasoning_content") or message.get("reasoning")
             if not content:
-                finish_reason = choices[0].get("finish_reason")
                 raise ValueError(
                     f"OpenRouter 回應沒有可用文字內容(content/reasoning 皆空，"
                     f"finish_reason={finish_reason!r})——可能是 max_tokens 太小，"
                     f"模型還在思考就被截斷了，試著調大 --max-tokens"
                 )
-            return content
+            return content, finish_reason
 
         if resp.status_code in (429, 500, 502, 503, 504):
             last_error = RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
@@ -248,6 +251,7 @@ def main():
     n_skipped = 0
     n_succeeded = 0
     n_failed = 0
+    n_truncated = 0
 
     for item in queries:
         qid = item["qid"]
@@ -257,7 +261,7 @@ def main():
                 n_skipped += 1
                 continue
             try:
-                gen_text = call_openrouter(
+                gen_text, finish_reason = call_openrouter(
                     api_key, args.model, item["query"],
                     args.temperature, args.max_tokens, args.timeout, args.max_retries,
                 )
@@ -268,8 +272,11 @@ def main():
                     "model": args.model,
                     "correct": correct,
                     "raw_generation": gen_text,
+                    "finish_reason": finish_reason,
                 })
                 n_succeeded += 1
+                if finish_reason == "length":
+                    n_truncated += 1
             except Exception as e:
                 n_failed += 1
                 print(f"[s_infer] qid={qid} sample={sample_idx} 失敗：{e}", file=sys.stderr)
@@ -300,6 +307,13 @@ def main():
     )
     if n_failed > 0:
         print(f"[s_infer] 失敗細節 → {errors_path}", file=sys.stderr)
+    if n_truncated > 0:
+        print(
+            f"[s_infer] ⚠️  {n_truncated}/{n_succeeded} 筆成功結果的 finish_reason=length"
+            f"（在 --max-tokens={args.max_tokens} 用完前被截斷，可能沒推到最終答案）——"
+            f"分析前建議用 finish_reason 欄位篩掉這些列，或調大 --max-tokens 重跑",
+            file=sys.stderr,
+        )
 
 
 if __name__ == "__main__":

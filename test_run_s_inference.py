@@ -89,26 +89,29 @@ class TestScoring(unittest.TestCase):
 class TestCallOpenRouter(unittest.TestCase):
     def test_success(self):
         with patch("run_s_inference.requests.post", return_value=_fake_response(200, "Answer: A")) as m:
-            text = rsi.call_openrouter("key", "qwen/qwen3.5-27b", "2+2=?", 0.7, 512, 30.0, 3)
+            text, finish_reason = rsi.call_openrouter("key", "qwen/qwen3.5-27b", "2+2=?", 0.7, 512, 30.0, 3)
         self.assertEqual(text, "Answer: A")
+        self.assertIsNone(finish_reason)  # _fake_response doesn't set one
         m.assert_called_once()
 
     def test_retries_then_succeeds(self):
         responses = [_fake_response(429, text="rate limited"), _fake_response(200, "Answer: B")]
         with patch("run_s_inference.requests.post", side_effect=responses):
             with patch("run_s_inference.time.sleep"):  # skip real backoff delay in test
-                text = rsi.call_openrouter("key", "qwen/qwen3.5-27b", "q", 0.7, 512, 30.0, 3)
+                text, _ = rsi.call_openrouter("key", "qwen/qwen3.5-27b", "q", 0.7, 512, 30.0, 3)
         self.assertEqual(text, "Answer: B")
 
     def test_null_content_falls_back_to_reasoning_content(self):
         # Regression for the real failure seen against qwen3.5-27b: content is null,
         # actual output ended up in reasoning_content instead.
         resp = _fake_message_response(
-            200, {"content": None, "reasoning_content": "I worked it out: \\boxed{116}"}
+            200, {"content": None, "reasoning_content": "I worked it out: \\boxed{116}"},
+            finish_reason="length",
         )
         with patch("run_s_inference.requests.post", return_value=resp):
-            text = rsi.call_openrouter("key", "m", "q", 0.7, 512, 30.0, 3)
+            text, finish_reason = rsi.call_openrouter("key", "m", "q", 0.7, 512, 30.0, 3)
         self.assertEqual(text, "I worked it out: \\boxed{116}")
+        self.assertEqual(finish_reason, "length")
 
     def test_null_content_and_no_reasoning_raises_clear_error(self):
         resp = _fake_message_response(200, {"content": None}, finish_reason="length")
@@ -156,12 +159,13 @@ class TestMainEndToEnd(unittest.TestCase):
                 rsi.main()
 
     def test_writes_expected_rows_and_resumes(self):
-        with patch("run_s_inference.call_openrouter", return_value="Answer: A"):
+        with patch("run_s_inference.call_openrouter", return_value=("Answer: A", "stop")):
             self._run_main(n_samples=2)
 
         df = pd.read_parquet(self.out_path)
         self.assertEqual(len(df), 6)  # 3 qids x 2 samples
         self.assertTrue((df["correct"] == 1).all())
+        self.assertTrue((df["finish_reason"] == "stop").all())
 
         # 續跑：call_openrouter 這次會直接報錯，若續跑邏輯正確，
         # 因為所有 (qid, sample_idx) 都已存在，不該再呼叫它，也不該報錯。
@@ -180,7 +184,7 @@ class TestMainEndToEnd(unittest.TestCase):
             call_count["n"] += 1
             if call_count["n"] % 2 == 0:
                 raise RuntimeError("simulated API failure")
-            return "Answer: A"
+            return "Answer: A", "stop"
 
         with patch("run_s_inference.call_openrouter", side_effect=flaky):
             self._run_main(n_samples=2)  # 3 qids x 2 samples = 6 calls -> 3 ok, 3 fail
