@@ -40,6 +40,28 @@ class TestScoring(unittest.TestCase):
         self.assertEqual(rsi.score_answer("The answer is C", "d"), 0)
         self.assertEqual(rsi.score_answer("no letter here", "A"), 0)
 
+    def test_extract_numeric_answer_boxed(self):
+        self.assertEqual(rsi.extract_numeric_answer("blah blah \\boxed{116} done"), "116")
+
+    def test_extract_numeric_answer_answer_is(self):
+        self.assertEqual(rsi.extract_numeric_answer("So the answer is 42."), "42")
+
+    def test_extract_numeric_answer_fallback_last_number(self):
+        # No boxed/"answer is" pattern -> falls back to last standalone integer
+        self.assertEqual(rsi.extract_numeric_answer("We had 3 cases, then 7, so total 10"), "10")
+
+    def test_extract_numeric_answer_none(self):
+        self.assertIsNone(rsi.extract_numeric_answer("I have no idea what the answer could be."))
+
+    def test_score_answer_numeric(self):
+        self.assertEqual(rsi.score_answer("\\boxed{756}", "756", "numeric"), 1)
+        self.assertEqual(rsi.score_answer("\\boxed{756}", "757", "numeric"), 0)
+        self.assertEqual(rsi.score_answer("no number at all", "150", "numeric"), 0)
+        # boxed takes priority even if a different number appears earlier in reasoning
+        self.assertEqual(
+            rsi.score_answer("first I tried 99 but the real answer is \\boxed{150}", "150", "numeric"), 1
+        )
+
 
 class TestCallOpenRouter(unittest.TestCase):
     def test_success(self):

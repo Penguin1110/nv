@@ -69,7 +69,37 @@ def extract_choice_letter(text: str) -> Optional[str]:
     return None
 
 
-def score_answer(generated_text: str, ground_truth: str) -> int:
+def extract_numeric_answer(text: str) -> Optional[str]:
+    """
+    給 AIME 這類整數答案(0-999)用。優先順序：
+      1. \\boxed{...} —— 數學競賽標準答案格式，跟資料集本身 solution 欄位寫法一致
+      2. "answer is/answer:/final answer:" 後面接的數字
+      3. 退而求其次：文字裡最後一個獨立整數(模型通常把最終答案放在推理過程最後)
+    """
+    text = text.strip()
+
+    m = re.search(r"\\boxed\{(-?\d+)\}", text)
+    if m:
+        return m.group(1)
+
+    m = re.search(r"(?:answer is|answer:|final answer:?)\s*\$?(-?\d+)\$?", text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+
+    numbers = re.findall(r"-?\d+", text)
+    return numbers[-1] if numbers else None
+
+
+def score_answer(generated_text: str, ground_truth: str, answer_type: str = "letter") -> int:
+    if answer_type == "numeric":
+        pred = extract_numeric_answer(generated_text)
+        if pred is None:
+            return 0
+        try:
+            return int(int(pred) == int(ground_truth.strip()))
+        except ValueError:
+            return 0
+
     pred = extract_choice_letter(generated_text)
     if pred is None:
         return 0
@@ -145,8 +175,12 @@ def main():
                           f"https://openrouter.ai/models 核對）")
     ap.add_argument("--n-samples", type=int, default=8,
                      help="每題呼叫幾次（多重採樣，用來估計 S 的 pass@1）")
+    ap.add_argument("--answer-type", choices=["letter", "numeric"], default="letter",
+                     help="letter=A-J 選擇題(預設)；numeric=整數答案(例如 AIME)")
     ap.add_argument("--temperature", type=float, default=0.7)
-    ap.add_argument("--max-tokens", type=int, default=512)
+    ap.add_argument("--max-tokens", type=int, default=2048,
+                     help="AIME 這類長推理題容易需要較多 token 才能推到最終答案；"
+                          "選擇題可以調小一點省成本")
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("--max-retries", type=int, default=3)
     ap.add_argument("--flush-every", type=int, default=10)
@@ -196,7 +230,7 @@ def main():
                     api_key, args.model, item["query"],
                     args.temperature, args.max_tokens, args.timeout, args.max_retries,
                 )
-                correct = score_answer(gen_text, item["ground_truth"])
+                correct = score_answer(gen_text, item["ground_truth"], args.answer_type)
                 buffer_rows.append({
                     "qid": qid,
                     "sample_idx": sample_idx,

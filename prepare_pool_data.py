@@ -14,17 +14,102 @@
 
 用法:
   python prepare_pool_data.py \
-      --bench-root <LLMRouterBench 根目錄> \
-      --dataset mmlu_pro \
+      --bench-root <解壓後的 bench-release 目錄> \
+      --dataset aime \
       --out-queries data/queries.jsonl \
       --out-labels data/labels.parquet \
       --limit 30
+
+實測下來 LLMRouterBench 實際解壓出來的結構是 <bench-release>/<dataset>/..., 不是官方
+README/download.md 寫的 results/bench/<dataset>——下面兩種都會嘗試,不需要自己搬檔案。
+資料集底下有時還多一層 split 目錄(test/valid/hybrid/subset_500/test_1000/... 不等,
+沒有固定命名),用 --split 指定;不指定的話,只有一種 split 會自動使用,超過一種要你自己選。
 """
 
 import argparse
 import json
 import sys
 from pathlib import Path
+from typing import List, Optional
+
+
+def _has_json(d: Path) -> bool:
+    return next(d.rglob("*.json"), None) is not None
+
+
+def find_dataset_dir(bench_root: Path, dataset: str) -> Path:
+    """
+    嘗試兩種可能的目錄佈局:
+      1. <bench_root>/results/bench/<dataset>  (README 寫的樣子)
+      2. <bench_root>/<dataset>                (實測解壓後的真實樣子)
+    """
+    candidates = [
+        bench_root / "results" / "bench" / dataset,
+        bench_root / dataset,
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+
+    available = sorted(
+        d.name for base in (bench_root / "results" / "bench", bench_root)
+        if base.exists() for d in base.iterdir() if d.is_dir()
+    )
+    raise FileNotFoundError(
+        f"找不到 dataset={dataset!r}。試過的路徑:\n  " +
+        "\n  ".join(str(c) for c in candidates) +
+        (f"\n\n{bench_root} 底下實際有的目錄:\n  " + "\n  ".join(available) if available else "")
+    )
+
+
+def find_model_dirs(ds_dir: Path, requested_split: Optional[str]) -> List[Path]:
+    """
+    每個模型一個子目錄(目錄名 = 模型名,這就是「規定好的池」的權威名單)。
+    有些資料集在模型目錄外還包一層 split 目錄,而且各資料集叫法不一致
+    (test/valid/hybrid/subset_500/test_1000/test_3000/v1/verified/...),
+    所以不用寫死白名單——直接偵測「這個子目錄底下有沒有 *.json」來判斷
+    它本身是不是模型目錄,不是的話就當作 split 目錄往下一層找。
+    """
+    direct_children = sorted(d for d in ds_dir.iterdir() if d.is_dir())
+    direct_model_dirs = [d for d in direct_children if _has_json(d)]
+
+    # 全部子目錄都直接有 json → 沒有 split 這一層,直接當模型目錄用
+    if direct_model_dirs and len(direct_model_dirs) == len(direct_children):
+        return direct_model_dirs
+
+    split_candidates = [d for d in direct_children if d not in direct_model_dirs]
+
+    # 混合情況(例如 arenahard 底下同時有模型目錄和一個雜散的 test/ split 目錄):
+    # 優先採用直接的模型目錄,雜散的 split 目錄只警告、不採用
+    if direct_model_dirs:
+        if split_candidates:
+            print(
+                f"[pool] 警告:{ds_dir.name} 底下混雜非模型子目錄，忽略：" +
+                ", ".join(d.name for d in split_candidates),
+                file=sys.stderr,
+            )
+        return direct_model_dirs
+
+    if not split_candidates:
+        return []
+
+    if requested_split is not None:
+        match = next((d for d in split_candidates if d.name == requested_split), None)
+        if match is None:
+            raise ValueError(
+                f"--split {requested_split!r} 不存在。{ds_dir.name} 底下可用的 split："
+                + ", ".join(d.name for d in split_candidates)
+            )
+        return sorted(d for d in match.iterdir() if d.is_dir())
+
+    if len(split_candidates) == 1:
+        return sorted(d for d in split_candidates[0].iterdir() if d.is_dir())
+
+    raise ValueError(
+        f"{ds_dir.name} 底下有多個可能的 split，請用 --split 指定其中一個："
+        + ", ".join(d.name for d in split_candidates)
+    )
+
 
 import pandas as pd
 
@@ -32,28 +117,18 @@ import pandas as pd
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bench-root", type=str, required=True)
-    ap.add_argument("--dataset", type=str, default="mmlu_pro")
+    ap.add_argument("--dataset", type=str, default="aime")
+    ap.add_argument("--split", type=str, default=None,
+                     help="資料集底下有多個 split 時指定其一(例如 test_1000)；"
+                          "只有一種 split 時可省略")
     ap.add_argument("--out-queries", type=str, required=True)
     ap.add_argument("--out-labels", type=str, required=True)
     ap.add_argument("--limit", type=int, default=None,
                      help="只取前 N 個 qid(依 index 排序後),pilot 用")
     args = ap.parse_args()
 
-    ds_dir = Path(args.bench_root) / "results" / "bench" / args.dataset
-    if not ds_dir.exists():
-        raise FileNotFoundError(
-            f"{ds_dir} 不存在。確認已解壓 bench-release 且 dataset 名稱正確;"
-            f"可先 ls results/bench/ 看實際的資料集目錄名。")
-
-    # 每個模型一個子目錄(目錄名 = 模型名,這就是「規定好的池」的權威名單)
-    model_dirs = sorted([d for d in ds_dir.iterdir() if d.is_dir()])
-    if not model_dirs:
-        # 有些版本可能多一層 split 目錄
-        for split in ("test", "validation", "val"):
-            alt = ds_dir / split
-            if alt.exists():
-                model_dirs = sorted([d for d in alt.iterdir() if d.is_dir()])
-                break
+    ds_dir = find_dataset_dir(Path(args.bench_root), args.dataset)
+    model_dirs = find_model_dirs(ds_dir, args.split)
     if not model_dirs:
         raise FileNotFoundError(f"{ds_dir} 底下找不到模型子目錄,請確認目錄結構")
 

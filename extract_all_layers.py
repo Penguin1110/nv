@@ -33,11 +33,48 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 def extract_choice_letter(text: str):
-    m = re.search(r"\b([A-J])\b", text.strip())
-    return m.group(1) if m else None
+    """
+    找獨立字母 A-J，但排除 "I"——它同時也是英文代名詞
+    ("I'm not sure" 會被誤判成選了選項 I)。
+    """
+    for m in re.finditer(r"\b([A-J])\b", text.strip()):
+        if m.group(1) == "I":
+            continue
+        return m.group(1)
+    return None
 
 
-def score_answer(generated_text: str, ground_truth: str) -> int:
+def extract_numeric_answer(text: str):
+    """
+    給 AIME 這類整數答案(0-999)用。優先順序：
+      1. \\boxed{...} —— 數學競賽標準答案格式
+      2. "answer is/answer:/final answer:" 後面接的數字
+      3. 退而求其次：文字裡最後一個獨立整數
+    """
+    text = text.strip()
+
+    m = re.search(r"\\boxed\{(-?\d+)\}", text)
+    if m:
+        return m.group(1)
+
+    m = re.search(r"(?:answer is|answer:|final answer:?)\s*\$?(-?\d+)\$?", text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+
+    numbers = re.findall(r"-?\d+", text)
+    return numbers[-1] if numbers else None
+
+
+def score_answer(generated_text: str, ground_truth: str, answer_type: str = "letter") -> int:
+    if answer_type == "numeric":
+        pred = extract_numeric_answer(generated_text)
+        if pred is None:
+            return 0
+        try:
+            return int(int(pred) == int(ground_truth.strip()))
+        except ValueError:
+            return 0
+
     pred = extract_choice_letter(generated_text)
     if pred is None:
         return 0
@@ -55,10 +92,22 @@ def main():
     ap.add_argument("--skip-generate", action="store_true",
                      help="不跑生成、不判對錯(標籤改由 benchmark 的 labels.parquet 提供時用這個);"
                           "只做 prefill forward 存 hidden state,速度快非常多")
+    ap.add_argument("--answer-type", choices=["letter", "numeric"], default="letter",
+                     help="letter=A-J 選擇題(預設)；numeric=整數答案(例如 AIME)")
+    ap.add_argument("--max-new-tokens", type=int, default=8,
+                     help="letter 選擇題 8 個 token 就夠；numeric(長推理題)建議調到"
+                          "1024-2048，不然模型還沒推到答案就被截斷")
     ap.add_argument("--flush-every", type=int, default=10)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
     args = ap.parse_args()
+
+    if args.answer_type == "numeric" and args.max_new_tokens == 8:
+        print(
+            "[警告] --answer-type numeric 但 --max-new-tokens 還是預設值 8，"
+            "長推理題大機率還沒推到答案就被截斷，建議加 --max-new-tokens 1024 以上",
+            file=sys.stderr,
+        )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
@@ -112,11 +161,11 @@ def main():
                 gen_text, correct = "", None
             else:
                 with torch.no_grad():
-                    gen = model.generate(**inputs, max_new_tokens=8, do_sample=False,
+                    gen = model.generate(**inputs, max_new_tokens=args.max_new_tokens, do_sample=False,
                                          pad_token_id=tokenizer.eos_token_id)
                 gen_text = tokenizer.decode(
                     gen[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-                correct = score_answer(gen_text, item["ground_truth"])
+                correct = score_answer(gen_text, item["ground_truth"], args.answer_type)
 
             buffer_rows.append({
                 "qid": item["qid"],
