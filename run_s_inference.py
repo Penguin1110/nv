@@ -10,7 +10,11 @@ OpenAI-相容 chat completions API。
 一樣估計 pass@1），輸出 qid/sample_idx/model/correct 到一個 parquet 檔——
 格式對應 core_prediction.py 讀 S 標籤時接受的「單一模型檔」格式。
 
-可續跑：中斷後重跑，已經有結果的 (qid, sample_idx) 會自動跳過，不重打 API。
+可續跑：中斷後重跑（含 Ctrl+C），已經有結果的 (qid, sample_idx) 會自動跳過，
+不重打 API；每完成一筆就立刻寫入磁碟，不會因為中斷而丟失已經花錢拿到的結果。
+
+預設 --concurrency 5 個請求同時進行（單次呼叫常要 60-400+ 秒，循序執行 720 次
+會跑一整天以上）；--concurrency 1 可退回完全循序。
 
 用法：
   cp .env.example .env   # 填入你自己的 OPENROUTER_API_KEY（.env 已加進 .gitignore）
@@ -18,17 +22,17 @@ OpenAI-相容 chat completions API。
       --queries data/queries.jsonl \
       --out data/s_correctness_qwen3.5-27b.parquet \
       --model qwen/qwen3.5-27b \
-      --n-samples 8 \
-      --limit 30
+      --answer-type numeric \
+      --max-tokens 8192 \
+      --n-samples 8
 
 也可以不建 .env，直接用環境變數：export OPENROUTER_API_KEY=sk-or-...
 
 ⚠️ --model 的字串是 OpenRouter 型錄裡的 slug，可能隨時間變動，正式跑之前
-   先去 https://openrouter.ai/models 搜尋 "qwen3.5-27b" 確認目前的正確名稱。
-⚠️ 這支腳本本身沒有在這個沙箱環境被真的打過 API（沒有金鑰、也可能沒有對外
-   網路），邏輯用 test_run_s_inference.py 的假 HTTP 回應測試過，但還沒有經過
-   真實 OpenRouter 回應驗證——第一次正式跑之前，建議先用 --limit 2 --n-samples 1
-   小規模跑一次，人工檢查 raw_generation 是否合理。
+   先去 https://openrouter.ai/models 搜尋確認目前的正確名稱。
+⚠️ finish_reason=length 代表在 max_tokens 用完前被截斷，可能沒推到最終答案——
+   即使拉高 max_tokens，AIME 難題還是有一定比例不會收斂，這是模型本身在這個
+   任務上的真實極限，不是 bug；分析時記得用這個欄位篩選資料品質。
 """
 
 import argparse
@@ -36,7 +40,9 @@ import json
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -190,6 +196,34 @@ def load_existing_keys(out_path: Path) -> set:
     return set(zip(df["qid"], df["sample_idx"]))
 
 
+_print_lock = threading.Lock()
+
+
+def _process_one(api_key, model, item, sample_idx, temperature, max_tokens, timeout, max_retries, answer_type):
+    """
+    在 worker thread 執行的純運算：呼叫 API + 計分。刻意不碰任何共用狀態
+    （不寫檔、不改計數器）——那些全部留在主執行緒依序處理，這樣完全不需要
+    對輸出檔/errors 檔/計數器加鎖，唯一需要鎖的只有終端機輸出（避免多執行緒
+    同時 print 導致文字疊在一起）。
+    """
+    with _print_lock:
+        print(f"[s_infer] qid={item['qid']} sample={sample_idx} 開始...", file=sys.stderr)
+    t0 = time.time()
+    gen_text, finish_reason = call_openrouter(
+        api_key, model, item["query"], temperature, max_tokens, timeout, max_retries
+    )
+    correct = score_answer(gen_text, item["ground_truth"], answer_type)
+    return {
+        "qid": item["qid"],
+        "sample_idx": sample_idx,
+        "model": model,
+        "correct": correct,
+        "raw_generation": gen_text,
+        "finish_reason": finish_reason,
+        "elapsed": time.time() - t0,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--queries", type=str, required=True)
@@ -199,6 +233,10 @@ def main():
                           f"https://openrouter.ai/models 核對）")
     ap.add_argument("--n-samples", type=int, default=8,
                      help="每題呼叫幾次（多重採樣，用來估計 S 的 pass@1）")
+    ap.add_argument("--concurrency", type=int, default=5,
+                     help="同時並行的 API 請求數(預設 5，保守值)。設成 1 等於退回完全"
+                          "循序執行。遇到 429 時，call_openrouter 本身已有重試/退避，"
+                          "不會因為並行就整個崩掉，只是個別請求會多等一下")
     ap.add_argument("--answer-type", choices=["letter", "numeric"], default="letter",
                      help="letter=A-J 選擇題(預設)；numeric=整數答案(例如 AIME)")
     ap.add_argument("--temperature", type=float, default=0.7)
@@ -250,7 +288,6 @@ def main():
         print(f"[s_infer] 累計 {len(df_new)} 筆 → {out_path}", file=sys.stderr)
 
     total_calls = len(queries) * args.n_samples
-    n_done = 0
     n_skipped = 0
     n_succeeded = 0
     n_failed = 0
@@ -271,65 +308,73 @@ def main():
                 file=sys.stderr,
             )
 
+    # 先把要打的 (item, sample_idx) 挑出來，已經做過的直接跳過不送進 executor。
+    tasks = []
+    for item in queries:
+        qid = item["qid"]
+        for sample_idx in range(args.n_samples):
+            if (qid, sample_idx) in done:
+                n_skipped += 1
+                continue
+            tasks.append((item, sample_idx))
+
+    print(
+        f"[s_infer] 待處理 {len(tasks)}/{total_calls} 筆(已跳過 {n_skipped} 筆)，"
+        f"並行數={args.concurrency}",
+        file=sys.stderr,
+    )
+
+    executor = ThreadPoolExecutor(max_workers=max(1, args.concurrency))
+    future_to_task = {
+        executor.submit(
+            _process_one, api_key, args.model, item, sample_idx,
+            args.temperature, args.max_tokens, args.timeout, args.max_retries, args.answer_type,
+        ): (item, sample_idx)
+        for item, sample_idx in tasks
+    }
+
+    n_processed = 0
     try:
-        for item in queries:
+        for future in as_completed(future_to_task):
+            item, sample_idx = future_to_task[future]
             qid = item["qid"]
-            for sample_idx in range(args.n_samples):
-                n_done += 1
-                if (qid, sample_idx) in done:
-                    n_skipped += 1
-                    continue
-                t0 = time.time()
+            n_processed += 1
+            try:
+                result = future.result()
+                buffer_rows.append({k: v for k, v in result.items() if k != "elapsed"})
+                n_succeeded += 1
+                if result["finish_reason"] == "length":
+                    n_truncated += 1
                 print(
-                    f"[s_infer] [{n_done}/{total_calls}] qid={qid} sample={sample_idx} 開始...",
+                    f"[s_infer] [{n_processed}/{len(tasks)}] qid={qid} sample={sample_idx} 完成 "
+                    f"(耗時 {result['elapsed']:.1f}s, correct={result['correct']}, "
+                    f"finish_reason={result['finish_reason']})",
                     file=sys.stderr,
                 )
-                try:
-                    gen_text, finish_reason = call_openrouter(
-                        api_key, args.model, item["query"],
-                        args.temperature, args.max_tokens, args.timeout, args.max_retries,
-                    )
-                    correct = score_answer(gen_text, item["ground_truth"], args.answer_type)
-                    buffer_rows.append({
-                        "qid": qid,
-                        "sample_idx": sample_idx,
-                        "model": args.model,
-                        "correct": correct,
-                        "raw_generation": gen_text,
-                        "finish_reason": finish_reason,
-                    })
-                    n_succeeded += 1
-                    if finish_reason == "length":
-                        n_truncated += 1
-                    print(
-                        f"[s_infer] [{n_done}/{total_calls}] qid={qid} sample={sample_idx} 完成 "
-                        f"(耗時 {time.time()-t0:.1f}s, correct={correct}, finish_reason={finish_reason})",
-                        file=sys.stderr,
-                    )
-                except Exception as e:
-                    n_failed += 1
-                    print(
-                        f"[s_infer] [{n_done}/{total_calls}] qid={qid} sample={sample_idx} 失敗 "
-                        f"(耗時 {time.time()-t0:.1f}s)：{e}",
-                        file=sys.stderr,
-                    )
-                    errors_file.write(json.dumps({
-                        "qid": qid, "sample_idx": sample_idx, "error": str(e),
-                    }, ensure_ascii=False) + "\n")
-                    errors_file.flush()
-                    continue
+            except Exception as e:
+                n_failed += 1
+                print(f"[s_infer] [{n_processed}/{len(tasks)}] qid={qid} sample={sample_idx} 失敗：{e}", file=sys.stderr)
+                errors_file.write(json.dumps({
+                    "qid": qid, "sample_idx": sample_idx, "error": str(e),
+                }, ensure_ascii=False) + "\n")
+                errors_file.flush()
 
-                if len(buffer_rows) >= args.flush_every:
-                    flush(buffer_rows)
-                    buffer_rows = []
+            if len(buffer_rows) >= args.flush_every:
+                flush(buffer_rows)
+                buffer_rows = []
 
-                if n_done % 20 == 0:
-                    print(
-                        f"[s_infer] 進度 {n_done}/{total_calls} "
-                        f"(成功 {n_succeeded}, 失敗 {n_failed}, 跳過 {n_skipped})",
-                        file=sys.stderr,
-                    )
+            if n_processed % 20 == 0:
+                print(
+                    f"[s_infer] 進度 {n_processed}/{len(tasks)} "
+                    f"(成功 {n_succeeded}, 失敗 {n_failed}, 跳過 {n_skipped})",
+                    file=sys.stderr,
+                )
     except KeyboardInterrupt:
+        # 還沒開始跑的任務直接取消；已經在跑的請求讓它自然結束(不強制殺執行緒)，
+        # 但不等它們，先把目前已經完成、還沒寫進磁碟的結果存下來。
+        for f in future_to_task:
+            f.cancel()
+        executor.shutdown(wait=False)
         flush(buffer_rows)
         errors_file.close()
         print(
@@ -340,6 +385,7 @@ def main():
         print_summary("中斷於處理中")
         sys.exit(130)
 
+    executor.shutdown(wait=True)
     flush(buffer_rows)
     errors_file.close()
     print_summary(f"完成 {len(queries)} 題 x {args.n_samples} 次採樣")

@@ -12,6 +12,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
@@ -144,13 +145,18 @@ class TestMainEndToEnd(unittest.TestCase):
             for i in range(3):
                 f.write(json.dumps({"qid": f"q{i}", "query": f"Question {i}", "ground_truth": "A"}) + "\n")
 
-    def _run_main(self, n_samples=2, limit=None):
+    def _run_main(self, n_samples=2, limit=None, concurrency=1):
+        # concurrency=1 by default: most of these tests use shared mutable
+        # counters (call_count["n"] etc.) that aren't thread-safe, and forcing
+        # sequential execution keeps assertions deterministic. The dedicated
+        # concurrency test below overrides this to actually exercise threading.
         argv = [
             "run_s_inference.py",
             "--queries", str(self.queries_path),
             "--out", str(self.out_path),
             "--n-samples", str(n_samples),
             "--flush-every", "1",
+            "--concurrency", str(concurrency),
         ]
         if limit is not None:
             argv += ["--limit", str(limit)]
@@ -220,6 +226,22 @@ class TestMainEndToEnd(unittest.TestCase):
         # The 2 calls that completed before the interrupt must already be on disk.
         df = pd.read_parquet(self.out_path)
         self.assertEqual(len(df), 2)
+
+    def test_concurrency_actually_overlaps(self):
+        # Each call "takes" 0.3s. Sequentially, 6 calls would take ~1.8s;
+        # with concurrency=5 they should mostly overlap and finish much faster.
+        def slow_call(*args, **kwargs):
+            time.sleep(0.3)
+            return "Answer: A", "stop"
+
+        with patch("run_s_inference.call_openrouter", side_effect=slow_call):
+            t0 = time.time()
+            self._run_main(n_samples=2, concurrency=5)
+            elapsed = time.time() - t0
+
+        df = pd.read_parquet(self.out_path)
+        self.assertEqual(len(df), 6)  # correctness unaffected by concurrency
+        self.assertLess(elapsed, 1.2, "6 calls at 0.3s each took as long as sequential — concurrency isn't overlapping")
 
     def test_missing_api_key_exits(self):
         argv = [
