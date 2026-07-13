@@ -182,7 +182,7 @@ def main():
                           for h in out.hidden_states]
 
             if args.skip_generate:
-                gen_text, correct = "", None
+                gen_text, correct, hit_max_new_tokens, n_new_tokens = "", None, None, None
             else:
                 with torch.no_grad():
                     # 明確傳入 eos_token_id：這個模型的 config.json/generation_config.json
@@ -191,6 +191,11 @@ def main():
                     gen = model.generate(**inputs, max_new_tokens=args.max_new_tokens, do_sample=False,
                                          eos_token_id=tokenizer.eos_token_id,
                                          pad_token_id=tokenizer.eos_token_id)
+                n_new_tokens = gen.shape[1] - inputs["input_ids"].shape[1]
+                # 沒有在自然的 EOS 前停下來，是被 max_new_tokens 硬切斷的——
+                # 跟 run_s_inference.py 的 finish_reason=="length" 是同一件事，
+                # 存下來才能分辨「真的推理失敗」還是「只是沒機會寫完」。
+                hit_max_new_tokens = (n_new_tokens >= args.max_new_tokens)
                 gen_text = tokenizer.decode(
                     gen[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
                 correct = score_answer(gen_text, item["ground_truth"], args.answer_type)
@@ -203,11 +208,14 @@ def main():
                 "num_layers_incl_embed": len(layer_vecs),
                 "correct": correct,
                 "raw_generation": gen_text,
+                "n_new_tokens": n_new_tokens,
+                "hit_max_new_tokens": hit_max_new_tokens,
                 "hidden_all_layers": layer_vecs,  # list[num_layers+1][hidden_dim]
             })
             print(
                 f"[extract_all] [{i+1}/{n_total}] qid={item['qid']} 完成 "
-                f"(耗時 {time.time()-t0:.1f}s, seq_len={seq_len}, correct={correct})",
+                f"(耗時 {time.time()-t0:.1f}s, seq_len={seq_len}, correct={correct}, "
+                f"新生成token數={n_new_tokens}, 是否被截斷={hit_max_new_tokens})",
                 file=sys.stderr,
             )
         except Exception as e:  # noqa: BLE001
