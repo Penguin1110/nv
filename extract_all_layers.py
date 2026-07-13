@@ -185,7 +185,11 @@ def main():
                 gen_text, correct = "", None
             else:
                 with torch.no_grad():
+                    # 明確傳入 eos_token_id：這個模型的 config.json/generation_config.json
+                    # 都沒有設定 eos_token_id，generate() 不知道該在 <|im_end|> 停下來，
+                    # 沒這行的話每次都會硬跑到 max_new_tokens 上限，就算已經寫出答案也不停。
                     gen = model.generate(**inputs, max_new_tokens=args.max_new_tokens, do_sample=False,
+                                         eos_token_id=tokenizer.eos_token_id,
                                          pad_token_id=tokenizer.eos_token_id)
                 gen_text = tokenizer.decode(
                     gen[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
