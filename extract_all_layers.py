@@ -11,13 +11,15 @@
   - 仍然會跑短生成來判斷「本模型自己」的對錯（closed-source target 的對錯
     由 run_closed_targets.py 另外收）
 
-⚠️ 本沙箱無 GPU/torch，此腳本未實際執行過，先 --limit 5 試跑。
+⚠️ 這支腳本沒有拿真實模型跑過完整流程過（開發環境的 GPU VRAM 太小跑不動 4B 模型），
+   語法/計分邏輯確認過沒問題，但正式全量跑之前務必先 --limit 5 試跑。
 
 用法：
   python extract_all_layers.py \
       --model Qwen/Qwen3.5-4B \
       --queries data/queries.jsonl \
-      --out data/all_layers_4b.parquet \
+      --out data/traces_Qwen3.5-4B.parquet \
+      --answer-type numeric --max-new-tokens 8192 \
       --token-pos last --limit 30
 """
 
@@ -26,6 +28,7 @@ import gc
 import json
 import re
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -148,7 +151,10 @@ def main():
         df.to_parquet(out_path)
         print(f"[extract_all] 累計 {len(df)} 筆 → {out_path}", file=sys.stderr)
 
+    n_total = len(queries)
     for i, item in enumerate(queries):
+        t0 = time.time()
+        print(f"[extract_all] [{i+1}/{n_total}] qid={item['qid']} 開始...", file=sys.stderr)
         try:
             inputs = tokenizer(item["query"], return_tensors="pt",
                                truncation=True, max_length=4096).to(device)
@@ -183,8 +189,17 @@ def main():
                 "raw_generation": gen_text,
                 "hidden_all_layers": layer_vecs,  # list[num_layers+1][hidden_dim]
             })
+            print(
+                f"[extract_all] [{i+1}/{n_total}] qid={item['qid']} 完成 "
+                f"(耗時 {time.time()-t0:.1f}s, seq_len={seq_len}, correct={correct})",
+                file=sys.stderr,
+            )
         except Exception as e:  # noqa: BLE001
-            print(f"[extract_all] 第 {i} 筆失敗：{e}", file=sys.stderr)
+            print(
+                f"[extract_all] [{i+1}/{n_total}] qid={item['qid']} 失敗 "
+                f"(耗時 {time.time()-t0:.1f}s)：{e}",
+                file=sys.stderr,
+            )
             continue
 
         if (i + 1) % args.flush_every == 0:
