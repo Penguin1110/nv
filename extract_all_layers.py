@@ -11,8 +11,11 @@
   - 仍然會跑短生成來判斷「本模型自己」的對錯（closed-source target 的對錯
     由 run_closed_targets.py 另外收）
 
-⚠️ 這支腳本沒有拿真實模型跑過完整流程過（開發環境的 GPU VRAM 太小跑不動 4B 模型），
-   語法/計分邏輯確認過沒問題，但正式全量跑之前務必先 --limit 5 試跑。
+可續跑（含 Ctrl+C）：已經在輸出檔裡的 qid 會自動跳過，不重跑；每完成一題就立刻
+寫入磁碟（--flush-every 預設 1），單題常要好幾分鐘 GPU 時間，不會因為中斷而丟失。
+
+⚠️ 已在真實 GPU 機器上驗證過能跑（Qwen3.5-4B），且需要 --apply-chat-template
+   （預設開）才會照指令回答，不然會亂生成到 --max-new-tokens 上限。
 
 用法：
   python extract_all_layers.py \
@@ -111,7 +114,10 @@ def main():
     ap.add_argument("--max-new-tokens", type=int, default=8,
                      help="letter 選擇題 8 個 token 就夠；numeric(長推理題)建議調到"
                           "1024-2048，不然模型還沒推到答案就被截斷")
-    ap.add_argument("--flush-every", type=int, default=10)
+    ap.add_argument("--flush-every", type=int, default=1,
+                     help="每完成幾題就寫入一次磁碟(預設每題都寫)。單題常要幾分鐘，"
+                          "調大這個值中斷時會多丟掉最多這個數字的結果(而且是已經花"
+                          "GPU 時間算出來的)——沒有特別理由不建議調大")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
     args = ap.parse_args()
@@ -144,6 +150,20 @@ def main():
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 可續跑：已經在輸出檔裡的 qid 直接跳過，不重跑(單題常要好幾分鐘 GPU 時間，
+    # 中斷後重打全部太浪費)。
+    if out_path.exists():
+        import pandas as pd
+        done_qids = set(pd.read_parquet(out_path, columns=["qid"])["qid"])
+        n_before = len(queries)
+        queries = [q for q in queries if q["qid"] not in done_qids]
+        if n_before != len(queries):
+            print(
+                f"[extract_all] 已有 {n_before - len(queries)} 筆結果，將跳過重跑",
+                file=sys.stderr,
+            )
+
     buffer_rows = []
 
     def flush(rows):
@@ -157,80 +177,89 @@ def main():
         print(f"[extract_all] 累計 {len(df)} 筆 → {out_path}", file=sys.stderr)
 
     n_total = len(queries)
-    for i, item in enumerate(queries):
-        t0 = time.time()
-        print(f"[extract_all] [{i+1}/{n_total}] qid={item['qid']} 開始...", file=sys.stderr)
-        try:
-            if args.apply_chat_template:
-                prompt_text = tokenizer.apply_chat_template(
-                    [{"role": "user", "content": item["query"]}],
-                    tokenize=False, add_generation_prompt=True,
-                )
-            else:
-                prompt_text = item["query"]
-            inputs = tokenizer(prompt_text, return_tensors="pt",
-                               truncation=True, max_length=4096).to(device)
-            with torch.no_grad():
-                out = model(**inputs, output_hidden_states=True, use_cache=False)
-
-            attn_mask = inputs["attention_mask"][0]
-            seq_len = int(attn_mask.sum().item())
-            pos = (seq_len - 1) if args.token_pos == "last" else 0
-
-            # hidden_states[0] 是 embedding 輸出，1..L 是各 transformer 層
-            layer_vecs = [h[0, pos].float().cpu().numpy().tolist()
-                          for h in out.hidden_states]
-
-            if args.skip_generate:
-                gen_text, correct, hit_max_new_tokens, n_new_tokens = "", None, None, None
-            else:
+    try:
+        for i, item in enumerate(queries):
+            t0 = time.time()
+            print(f"[extract_all] [{i+1}/{n_total}] qid={item['qid']} 開始...", file=sys.stderr)
+            try:
+                if args.apply_chat_template:
+                    prompt_text = tokenizer.apply_chat_template(
+                        [{"role": "user", "content": item["query"]}],
+                        tokenize=False, add_generation_prompt=True,
+                    )
+                else:
+                    prompt_text = item["query"]
+                inputs = tokenizer(prompt_text, return_tensors="pt",
+                                   truncation=True, max_length=4096).to(device)
                 with torch.no_grad():
-                    # 明確傳入 eos_token_id：這個模型的 config.json/generation_config.json
-                    # 都沒有設定 eos_token_id，generate() 不知道該在 <|im_end|> 停下來，
-                    # 沒這行的話每次都會硬跑到 max_new_tokens 上限，就算已經寫出答案也不停。
-                    gen = model.generate(**inputs, max_new_tokens=args.max_new_tokens, do_sample=False,
-                                         eos_token_id=tokenizer.eos_token_id,
-                                         pad_token_id=tokenizer.eos_token_id)
-                n_new_tokens = gen.shape[1] - inputs["input_ids"].shape[1]
-                # 沒有在自然的 EOS 前停下來，是被 max_new_tokens 硬切斷的——
-                # 跟 run_s_inference.py 的 finish_reason=="length" 是同一件事，
-                # 存下來才能分辨「真的推理失敗」還是「只是沒機會寫完」。
-                hit_max_new_tokens = (n_new_tokens >= args.max_new_tokens)
-                gen_text = tokenizer.decode(
-                    gen[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-                correct = score_answer(gen_text, item["ground_truth"], args.answer_type)
+                    out = model(**inputs, output_hidden_states=True, use_cache=False)
 
-            buffer_rows.append({
-                "qid": item["qid"],
-                "model": args.model,
-                "token_pos": args.token_pos,
-                "seq_len": seq_len,
-                "num_layers_incl_embed": len(layer_vecs),
-                "correct": correct,
-                "raw_generation": gen_text,
-                "n_new_tokens": n_new_tokens,
-                "hit_max_new_tokens": hit_max_new_tokens,
-                "hidden_all_layers": layer_vecs,  # list[num_layers+1][hidden_dim]
-            })
-            print(
-                f"[extract_all] [{i+1}/{n_total}] qid={item['qid']} 完成 "
-                f"(耗時 {time.time()-t0:.1f}s, seq_len={seq_len}, correct={correct}, "
-                f"新生成token數={n_new_tokens}, 是否被截斷={hit_max_new_tokens})",
-                file=sys.stderr,
-            )
-        except Exception as e:  # noqa: BLE001
-            print(
-                f"[extract_all] [{i+1}/{n_total}] qid={item['qid']} 失敗 "
-                f"(耗時 {time.time()-t0:.1f}s)：{e}",
-                file=sys.stderr,
-            )
-            continue
+                attn_mask = inputs["attention_mask"][0]
+                seq_len = int(attn_mask.sum().item())
+                pos = (seq_len - 1) if args.token_pos == "last" else 0
 
-        if (i + 1) % args.flush_every == 0:
-            flush(buffer_rows); buffer_rows = []
-            gc.collect()
-            if device == "cuda":
-                torch.cuda.empty_cache()
+                # hidden_states[0] 是 embedding 輸出，1..L 是各 transformer 層
+                layer_vecs = [h[0, pos].float().cpu().numpy().tolist()
+                              for h in out.hidden_states]
+
+                if args.skip_generate:
+                    gen_text, correct, hit_max_new_tokens, n_new_tokens = "", None, None, None
+                else:
+                    with torch.no_grad():
+                        # 明確傳入 eos_token_id：這個模型的 config.json/generation_config.json
+                        # 都沒有設定 eos_token_id，generate() 不知道該在 <|im_end|> 停下來，
+                        # 沒這行的話每次都會硬跑到 max_new_tokens 上限，就算已經寫出答案也不停。
+                        gen = model.generate(**inputs, max_new_tokens=args.max_new_tokens, do_sample=False,
+                                             eos_token_id=tokenizer.eos_token_id,
+                                             pad_token_id=tokenizer.eos_token_id)
+                    n_new_tokens = gen.shape[1] - inputs["input_ids"].shape[1]
+                    # 沒有在自然的 EOS 前停下來，是被 max_new_tokens 硬切斷的——
+                    # 跟 run_s_inference.py 的 finish_reason=="length" 是同一件事，
+                    # 存下來才能分辨「真的推理失敗」還是「只是沒機會寫完」。
+                    hit_max_new_tokens = (n_new_tokens >= args.max_new_tokens)
+                    gen_text = tokenizer.decode(
+                        gen[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+                    correct = score_answer(gen_text, item["ground_truth"], args.answer_type)
+
+                buffer_rows.append({
+                    "qid": item["qid"],
+                    "model": args.model,
+                    "token_pos": args.token_pos,
+                    "seq_len": seq_len,
+                    "num_layers_incl_embed": len(layer_vecs),
+                    "correct": correct,
+                    "raw_generation": gen_text,
+                    "n_new_tokens": n_new_tokens,
+                    "hit_max_new_tokens": hit_max_new_tokens,
+                    "hidden_all_layers": layer_vecs,  # list[num_layers+1][hidden_dim]
+                })
+                print(
+                    f"[extract_all] [{i+1}/{n_total}] qid={item['qid']} 完成 "
+                    f"(耗時 {time.time()-t0:.1f}s, seq_len={seq_len}, correct={correct}, "
+                    f"新生成token數={n_new_tokens}, 是否被截斷={hit_max_new_tokens})",
+                    file=sys.stderr,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(
+                    f"[extract_all] [{i+1}/{n_total}] qid={item['qid']} 失敗 "
+                    f"(耗時 {time.time()-t0:.1f}s)：{e}",
+                    file=sys.stderr,
+                )
+                continue
+
+            if (i + 1) % args.flush_every == 0:
+                flush(buffer_rows); buffer_rows = []
+                gc.collect()
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+    except KeyboardInterrupt:
+        flush(buffer_rows)
+        print(
+            f"\n[extract_all] 使用者中斷(Ctrl+C)——已寫入的結果都在 {out_path}，"
+            f"重跑同一個指令會自動跳過已完成的 qid、從這裡繼續",
+            file=sys.stderr,
+        )
+        sys.exit(130)
 
     flush(buffer_rows)
     print(f"[extract_all] 完成 {len(queries)} 筆", file=sys.stderr)
