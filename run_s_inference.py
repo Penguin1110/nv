@@ -207,7 +207,10 @@ def main():
                           "選擇題可以調小一點省成本")
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("--max-retries", type=int, default=3)
-    ap.add_argument("--flush-every", type=int, default=10)
+    ap.add_argument("--flush-every", type=int, default=1,
+                     help="每完成幾筆成功結果就寫入一次磁碟(預設每筆都寫)。單次 API 呼叫"
+                          "常要 60-100 秒以上，調大這個值只是省一點點 I/O，但中斷時會多"
+                          "丟掉最多這個數字的結果——沒有特別理由不建議調大")
     ap.add_argument("--limit", type=int, default=None)
     args = ap.parse_args()
 
@@ -253,81 +256,93 @@ def main():
     n_failed = 0
     n_truncated = 0
 
-    for item in queries:
-        qid = item["qid"]
-        for sample_idx in range(args.n_samples):
-            n_done += 1
-            if (qid, sample_idx) in done:
-                n_skipped += 1
-                continue
-            t0 = time.time()
+    def print_summary(label):
+        print(
+            f"[s_infer] {label} —— 成功 {n_succeeded}, 失敗 {n_failed}, 跳過(已存在) {n_skipped}",
+            file=sys.stderr,
+        )
+        if n_failed > 0:
+            print(f"[s_infer] 失敗細節 → {errors_path}", file=sys.stderr)
+        if n_truncated > 0:
             print(
-                f"[s_infer] [{n_done}/{total_calls}] qid={qid} sample={sample_idx} 開始...",
+                f"[s_infer] ⚠️  {n_truncated}/{n_succeeded} 筆成功結果的 finish_reason=length"
+                f"（在 --max-tokens={args.max_tokens} 用完前被截斷，可能沒推到最終答案）——"
+                f"分析前建議用 finish_reason 欄位篩掉這些列，或調大 --max-tokens 重跑",
                 file=sys.stderr,
             )
-            try:
-                gen_text, finish_reason = call_openrouter(
-                    api_key, args.model, item["query"],
-                    args.temperature, args.max_tokens, args.timeout, args.max_retries,
-                )
-                correct = score_answer(gen_text, item["ground_truth"], args.answer_type)
-                buffer_rows.append({
-                    "qid": qid,
-                    "sample_idx": sample_idx,
-                    "model": args.model,
-                    "correct": correct,
-                    "raw_generation": gen_text,
-                    "finish_reason": finish_reason,
-                })
-                n_succeeded += 1
-                if finish_reason == "length":
-                    n_truncated += 1
-                print(
-                    f"[s_infer] [{n_done}/{total_calls}] qid={qid} sample={sample_idx} 完成 "
-                    f"(耗時 {time.time()-t0:.1f}s, correct={correct}, finish_reason={finish_reason})",
-                    file=sys.stderr,
-                )
-            except Exception as e:
-                n_failed += 1
-                print(
-                    f"[s_infer] [{n_done}/{total_calls}] qid={qid} sample={sample_idx} 失敗 "
-                    f"(耗時 {time.time()-t0:.1f}s)：{e}",
-                    file=sys.stderr,
-                )
-                errors_file.write(json.dumps({
-                    "qid": qid, "sample_idx": sample_idx, "error": str(e),
-                }, ensure_ascii=False) + "\n")
-                errors_file.flush()
-                continue
 
-            if len(buffer_rows) >= args.flush_every:
-                flush(buffer_rows)
-                buffer_rows = []
-
-            if n_done % 20 == 0:
+    try:
+        for item in queries:
+            qid = item["qid"]
+            for sample_idx in range(args.n_samples):
+                n_done += 1
+                if (qid, sample_idx) in done:
+                    n_skipped += 1
+                    continue
+                t0 = time.time()
                 print(
-                    f"[s_infer] 進度 {n_done}/{total_calls} "
-                    f"(成功 {n_succeeded}, 失敗 {n_failed}, 跳過 {n_skipped})",
+                    f"[s_infer] [{n_done}/{total_calls}] qid={qid} sample={sample_idx} 開始...",
                     file=sys.stderr,
                 )
+                try:
+                    gen_text, finish_reason = call_openrouter(
+                        api_key, args.model, item["query"],
+                        args.temperature, args.max_tokens, args.timeout, args.max_retries,
+                    )
+                    correct = score_answer(gen_text, item["ground_truth"], args.answer_type)
+                    buffer_rows.append({
+                        "qid": qid,
+                        "sample_idx": sample_idx,
+                        "model": args.model,
+                        "correct": correct,
+                        "raw_generation": gen_text,
+                        "finish_reason": finish_reason,
+                    })
+                    n_succeeded += 1
+                    if finish_reason == "length":
+                        n_truncated += 1
+                    print(
+                        f"[s_infer] [{n_done}/{total_calls}] qid={qid} sample={sample_idx} 完成 "
+                        f"(耗時 {time.time()-t0:.1f}s, correct={correct}, finish_reason={finish_reason})",
+                        file=sys.stderr,
+                    )
+                except Exception as e:
+                    n_failed += 1
+                    print(
+                        f"[s_infer] [{n_done}/{total_calls}] qid={qid} sample={sample_idx} 失敗 "
+                        f"(耗時 {time.time()-t0:.1f}s)：{e}",
+                        file=sys.stderr,
+                    )
+                    errors_file.write(json.dumps({
+                        "qid": qid, "sample_idx": sample_idx, "error": str(e),
+                    }, ensure_ascii=False) + "\n")
+                    errors_file.flush()
+                    continue
+
+                if len(buffer_rows) >= args.flush_every:
+                    flush(buffer_rows)
+                    buffer_rows = []
+
+                if n_done % 20 == 0:
+                    print(
+                        f"[s_infer] 進度 {n_done}/{total_calls} "
+                        f"(成功 {n_succeeded}, 失敗 {n_failed}, 跳過 {n_skipped})",
+                        file=sys.stderr,
+                    )
+    except KeyboardInterrupt:
+        flush(buffer_rows)
+        errors_file.close()
+        print(
+            f"\n[s_infer] 使用者中斷(Ctrl+C)——已寫入的結果都在 {out_path}，"
+            f"重跑同一個指令會自動跳過已完成的部分、從這裡繼續",
+            file=sys.stderr,
+        )
+        print_summary("中斷於處理中")
+        sys.exit(130)
 
     flush(buffer_rows)
     errors_file.close()
-
-    print(
-        f"[s_infer] 完成 {len(queries)} 題 x {args.n_samples} 次採樣 —— "
-        f"成功 {n_succeeded}, 失敗 {n_failed}, 跳過(已存在) {n_skipped}",
-        file=sys.stderr,
-    )
-    if n_failed > 0:
-        print(f"[s_infer] 失敗細節 → {errors_path}", file=sys.stderr)
-    if n_truncated > 0:
-        print(
-            f"[s_infer] ⚠️  {n_truncated}/{n_succeeded} 筆成功結果的 finish_reason=length"
-            f"（在 --max-tokens={args.max_tokens} 用完前被截斷，可能沒推到最終答案）——"
-            f"分析前建議用 finish_reason 欄位篩掉這些列，或調大 --max-tokens 重跑",
-            file=sys.stderr,
-        )
+    print_summary(f"完成 {len(queries)} 題 x {args.n_samples} 次採樣")
 
 
 if __name__ == "__main__":

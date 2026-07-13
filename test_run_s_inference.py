@@ -201,6 +201,26 @@ class TestMainEndToEnd(unittest.TestCase):
         self.assertIn("qid", error_rows[0])
         self.assertIn("sample_idx", error_rows[0])
 
+    def test_keyboard_interrupt_flushes_progress_so_far(self):
+        # Regression: user hit Ctrl+C partway through a real run and lost the
+        # already-completed rows because they hadn't been flushed to disk yet.
+        call_count = {"n": 0}
+
+        def interrupt_after_two(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 3:
+                raise KeyboardInterrupt()
+            return "Answer: A", "stop"
+
+        with patch("run_s_inference.call_openrouter", side_effect=interrupt_after_two):
+            with self.assertRaises(SystemExit) as cm:
+                self._run_main(n_samples=2)
+        self.assertEqual(cm.exception.code, 130)
+
+        # The 2 calls that completed before the interrupt must already be on disk.
+        df = pd.read_parquet(self.out_path)
+        self.assertEqual(len(df), 2)
+
     def test_missing_api_key_exits(self):
         argv = [
             "run_s_inference.py",
