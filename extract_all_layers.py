@@ -111,6 +111,13 @@ def main():
                           "instruct 模型沒套用這個通常不會照指令回答，只會亂接龍到"
                           "--max-new-tokens 上限。只有題目本身已經是完整格式化 prompt"
                           "(例如舊的 LLMRouterBench 流程)時才需要用 --no-apply-chat-template 關掉")
+    ap.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=True,
+                     help="思考型模型(chat template 會自動接 <think>)是否允許長鏈推理"
+                          "(預設開)。實測 AIME 難題常常推理到 max_new_tokens 都收斂不了；"
+                          "用 --no-enable-thinking 會強制塞一個已關閉的空 <think></think>，"
+                          "逼模型跳過推理直接回答，速度快很多但正確率可能下降。"
+                          "只有 --apply-chat-template 開著、且模型的 chat template 支援"
+                          "這個參數時才有作用")
     ap.add_argument("--max-new-tokens", type=int, default=8,
                      help="letter 選擇題 8 個 token 就夠；numeric(長推理題)建議調到"
                           "1024-2048，不然模型還沒推到答案就被截斷")
@@ -186,6 +193,7 @@ def main():
                     prompt_text = tokenizer.apply_chat_template(
                         [{"role": "user", "content": item["query"]}],
                         tokenize=False, add_generation_prompt=True,
+                        enable_thinking=args.enable_thinking,
                     )
                 else:
                     prompt_text = item["query"]
