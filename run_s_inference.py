@@ -260,6 +260,11 @@ def main():
             if (qid, sample_idx) in done:
                 n_skipped += 1
                 continue
+            t0 = time.time()
+            print(
+                f"[s_infer] [{n_done}/{total_calls}] qid={qid} sample={sample_idx} 開始...",
+                file=sys.stderr,
+            )
             try:
                 gen_text, finish_reason = call_openrouter(
                     api_key, args.model, item["query"],
@@ -277,9 +282,18 @@ def main():
                 n_succeeded += 1
                 if finish_reason == "length":
                     n_truncated += 1
+                print(
+                    f"[s_infer] [{n_done}/{total_calls}] qid={qid} sample={sample_idx} 完成 "
+                    f"(耗時 {time.time()-t0:.1f}s, correct={correct}, finish_reason={finish_reason})",
+                    file=sys.stderr,
+                )
             except Exception as e:
                 n_failed += 1
-                print(f"[s_infer] qid={qid} sample={sample_idx} 失敗：{e}", file=sys.stderr)
+                print(
+                    f"[s_infer] [{n_done}/{total_calls}] qid={qid} sample={sample_idx} 失敗 "
+                    f"(耗時 {time.time()-t0:.1f}s)：{e}",
+                    file=sys.stderr,
+                )
                 errors_file.write(json.dumps({
                     "qid": qid, "sample_idx": sample_idx, "error": str(e),
                 }, ensure_ascii=False) + "\n")
