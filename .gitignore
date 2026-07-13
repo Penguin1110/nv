@@ -6,6 +6,10 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
-# Generated data / results (mock or real — regenerate via mock_data.py or the real pipeline)
-data/
+# Generated data / results (mock or real — regenerate via mock_data.py or the real pipeline).
+# Exception: data/queries.jsonl is small, deterministic (same 90 AIME problems), has no
+# secrets, and both machines need it — tracked so `git pull` is enough instead of
+# re-downloading from HF or scp'ing it around.
+data/*
+!data/queries.jsonl
 results/

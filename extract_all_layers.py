@@ -103,6 +103,11 @@ def main():
                           "只做 prefill forward 存 hidden state,速度快非常多")
     ap.add_argument("--answer-type", choices=["letter", "numeric"], default="letter",
                      help="letter=A-J 選擇題(預設)；numeric=整數答案(例如 AIME)")
+    ap.add_argument("--apply-chat-template", action=argparse.BooleanOptionalAction, default=True,
+                     help="用 tokenizer 的 chat template 包裝 query 再餵給模型(預設開)。"
+                          "instruct 模型沒套用這個通常不會照指令回答，只會亂接龍到"
+                          "--max-new-tokens 上限。只有題目本身已經是完整格式化 prompt"
+                          "(例如舊的 LLMRouterBench 流程)時才需要用 --no-apply-chat-template 關掉")
     ap.add_argument("--max-new-tokens", type=int, default=8,
                      help="letter 選擇題 8 個 token 就夠；numeric(長推理題)建議調到"
                           "1024-2048，不然模型還沒推到答案就被截斷")
@@ -156,7 +161,14 @@ def main():
         t0 = time.time()
         print(f"[extract_all] [{i+1}/{n_total}] qid={item['qid']} 開始...", file=sys.stderr)
         try:
-            inputs = tokenizer(item["query"], return_tensors="pt",
+            if args.apply_chat_template:
+                prompt_text = tokenizer.apply_chat_template(
+                    [{"role": "user", "content": item["query"]}],
+                    tokenize=False, add_generation_prompt=True,
+                )
+            else:
+                prompt_text = item["query"]
+            inputs = tokenizer(prompt_text, return_tensors="pt",
                                truncation=True, max_length=4096).to(device)
             with torch.no_grad():
                 out = model(**inputs, output_hidden_states=True, use_cache=False)
