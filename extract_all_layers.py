@@ -100,7 +100,15 @@ def main():
     ap.add_argument("--queries", type=str, required=True)
     ap.add_argument("--out", type=str, required=True)
     ap.add_argument("--token-pos", choices=["last", "first"], default="last",
-                     help="last=prompt 最後位置(正確選擇)；first=位置0(對照用，預期無訊號)")
+                     help="last=prompt 最後位置(正確選擇)；first=位置0(對照用，預期無訊號)。"
+                          "有指定 --token-positions 時這個參數會被忽略")
+    ap.add_argument("--token-positions", type=str, default=None,
+                     help="逗號分隔的固定絕對 token 位置，例如 '10,20,30,50,75'，用來對"
+                          "hidden state 做時序分析(每個位置每一層都會存一份向量)。指定這個"
+                          "會覆蓋 --token-pos，改成多位置模式。題目太短、某個位置超出"
+                          "seq_len 範圍時會直接跳過那個位置(不同題目實際存到的位置數可能"
+                          "不一樣，要用 available_token_positions 欄位對齊，不要假設每列"
+                          "位置數相同)")
     ap.add_argument("--skip-generate", action="store_true",
                      help="不跑生成、不判對錯(標籤改由 benchmark 的 labels.parquet 提供時用這個);"
                           "只做 prefill forward 存 hidden state,速度快非常多")
@@ -135,6 +143,11 @@ def main():
             "長推理題大機率還沒推到答案就被截斷，建議加 --max-new-tokens 1024 以上",
             file=sys.stderr,
         )
+
+    token_positions = None
+    if args.token_positions:
+        token_positions = sorted(int(x) for x in args.token_positions.split(","))
+        print(f"[extract_all] 多位置模式，固定位置：{token_positions}", file=sys.stderr)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
@@ -204,11 +217,23 @@ def main():
 
                 attn_mask = inputs["attention_mask"][0]
                 seq_len = int(attn_mask.sum().item())
-                pos = (seq_len - 1) if args.token_pos == "last" else 0
 
-                # hidden_states[0] 是 embedding 輸出，1..L 是各 transformer 層
-                layer_vecs = [h[0, pos].float().cpu().numpy().tolist()
-                              for h in out.hidden_states]
+                # hidden_states[0] 是 embedding 輸出，1..L 是各 transformer 層。
+                # forward pass 本身就已經算出每一個 token 位置的 hidden state，
+                # 這裡只是決定要「存」哪幾個位置，不需要為了多位置額外多跑一次模型。
+                if token_positions is not None:
+                    available_positions = [p for p in token_positions if p < seq_len]
+                    hidden_by_position = [
+                        [h[0, p].float().cpu().numpy().tolist() for h in out.hidden_states]
+                        for p in available_positions
+                    ]
+                    layer_vecs = None  # 多位置模式下不存單一位置版本，避免混淆
+                else:
+                    pos = (seq_len - 1) if args.token_pos == "last" else 0
+                    layer_vecs = [h[0, pos].float().cpu().numpy().tolist()
+                                  for h in out.hidden_states]
+                    available_positions = None
+                    hidden_by_position = None
 
                 if args.skip_generate:
                     gen_text, correct, hit_max_new_tokens, n_new_tokens = "", None, None, None
@@ -229,18 +254,33 @@ def main():
                         gen[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
                     correct = score_answer(gen_text, item["ground_truth"], args.answer_type)
 
-                buffer_rows.append({
+                row = {
                     "qid": item["qid"],
                     "model": args.model,
-                    "token_pos": args.token_pos,
                     "seq_len": seq_len,
-                    "num_layers_incl_embed": len(layer_vecs),
+                    "num_layers_incl_embed": len(out.hidden_states),
                     "correct": correct,
                     "raw_generation": gen_text,
                     "n_new_tokens": n_new_tokens,
                     "hit_max_new_tokens": hit_max_new_tokens,
-                    "hidden_all_layers": layer_vecs,  # list[num_layers+1][hidden_dim]
-                })
+                }
+                if token_positions is not None:
+                    if not available_positions:
+                        print(
+                            f"[extract_all] 警告：qid={item['qid']} 的 seq_len={seq_len} "
+                            f"比所有指定位置都短，這題沒有任何位置的 hidden state 可存",
+                            file=sys.stderr,
+                        )
+                    row["requested_token_positions"] = token_positions
+                    row["available_token_positions"] = available_positions
+                    # list[num_available_positions][num_layers+1][hidden_dim]；
+                    # 不同題目 num_available_positions 可能不同(見上面警告)，
+                    # 分析時要用 available_token_positions 對齊，不要假設固定長度。
+                    row["hidden_states_by_position"] = hidden_by_position
+                else:
+                    row["token_pos"] = args.token_pos
+                    row["hidden_all_layers"] = layer_vecs  # list[num_layers+1][hidden_dim]
+                buffer_rows.append(row)
                 print(
                     f"[extract_all] [{i+1}/{n_total}] qid={item['qid']} 完成 "
                     f"(耗時 {time.time()-t0:.1f}s, seq_len={seq_len}, correct={correct}, "
