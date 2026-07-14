@@ -128,6 +128,7 @@ def call_openrouter(
     max_tokens: int,
     timeout: float,
     max_retries: int,
+    disable_reasoning: bool = False,
 ) -> Tuple[str, Optional[str]]:
     """
     打一次 OpenRouter chat completions，回傳 (生成文字, finish_reason)。
@@ -146,6 +147,11 @@ def call_openrouter(
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    if disable_reasoning:
+        # OpenRouter 統一 reasoning 參數：跟本地 extract_all_layers.py 的
+        # --no-enable-thinking 是同一個目的，逼「思考型」模型跳過長鏈推理
+        # 直接回答。不支援 reasoning 的模型會直接忽略這個欄位，不會報錯。
+        payload["reasoning"] = {"enabled": False}
 
     last_error = None
     for attempt in range(max_retries + 1):
@@ -199,7 +205,8 @@ def load_existing_keys(out_path: Path) -> set:
 _print_lock = threading.Lock()
 
 
-def _process_one(api_key, model, item, sample_idx, temperature, max_tokens, timeout, max_retries, answer_type):
+def _process_one(api_key, model, item, sample_idx, temperature, max_tokens, timeout, max_retries,
+                  answer_type, disable_reasoning=False):
     """
     在 worker thread 執行的純運算：呼叫 API + 計分。刻意不碰任何共用狀態
     （不寫檔、不改計數器）——那些全部留在主執行緒依序處理，這樣完全不需要
@@ -210,7 +217,8 @@ def _process_one(api_key, model, item, sample_idx, temperature, max_tokens, time
         print(f"[s_infer] qid={item['qid']} sample={sample_idx} 開始...", file=sys.stderr)
     t0 = time.time()
     gen_text, finish_reason = call_openrouter(
-        api_key, model, item["query"], temperature, max_tokens, timeout, max_retries
+        api_key, model, item["query"], temperature, max_tokens, timeout, max_retries,
+        disable_reasoning=disable_reasoning,
     )
     correct = score_answer(gen_text, item["ground_truth"], answer_type)
     return {
@@ -239,6 +247,10 @@ def main():
                           "不會因為並行就整個崩掉，只是個別請求會多等一下")
     ap.add_argument("--answer-type", choices=["letter", "numeric"], default="letter",
                      help="letter=A-J 選擇題(預設)；numeric=整數答案(例如 AIME)")
+    ap.add_argument("--disable-reasoning", action="store_true",
+                     help="傳 OpenRouter 的 reasoning.enabled=false，逼思考型模型跳過長鏈"
+                          "推理直接回答(跟本地 extract_all_layers.py 的 --no-enable-thinking "
+                          "同樣目的)。模型不支援 reasoning 參數的話會被直接忽略，不會報錯")
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--max-tokens", type=int, default=2048,
                      help="AIME 這類長推理題容易需要較多 token 才能推到最終答案；"
@@ -329,6 +341,7 @@ def main():
         executor.submit(
             _process_one, api_key, args.model, item, sample_idx,
             args.temperature, args.max_tokens, args.timeout, args.max_retries, args.answer_type,
+            args.disable_reasoning,
         ): (item, sample_idx)
         for item, sample_idx in tasks
     }

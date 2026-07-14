@@ -94,6 +94,12 @@ class TestCallOpenRouter(unittest.TestCase):
         self.assertEqual(text, "Answer: A")
         self.assertIsNone(finish_reason)  # _fake_response doesn't set one
         m.assert_called_once()
+        self.assertNotIn("reasoning", m.call_args.kwargs["json"])
+
+    def test_disable_reasoning_sets_payload_field(self):
+        with patch("run_s_inference.requests.post", return_value=_fake_response(200, "Answer: A")) as m:
+            rsi.call_openrouter("key", "qwen/qwen3.5-9b", "q", 0.7, 512, 30.0, 3, disable_reasoning=True)
+        self.assertEqual(m.call_args.kwargs["json"]["reasoning"], {"enabled": False})
 
     def test_retries_then_succeeds(self):
         responses = [_fake_response(429, text="rate limited"), _fake_response(200, "Answer: B")]
