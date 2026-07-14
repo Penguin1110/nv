@@ -6,10 +6,15 @@ __pycache__/
 *.pyc
 .pytest_cache/
 
+# Runtime logs from nohup/background runs
+*.log
+
 # Generated data / results (mock or real — regenerate via mock_data.py or the real pipeline).
 # Exception: data/queries.jsonl is small, deterministic (same 90 AIME problems), has no
 # secrets, and both machines need it — tracked so `git pull` is enough instead of
 # re-downloading from HF or scp'ing it around.
 data/*
 !data/queries.jsonl
+!data/s_correctness_qwen3.5-27b.parquet
+!data/s_correctness_qwen3.5-9b.parquet
 results/
