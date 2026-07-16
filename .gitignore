@@ -20,4 +20,6 @@ data/*
 !data/pca_basis_layer_last.json
 !data/qids_shared_hard.txt
 !data/qids_salvageable.txt
+!data/qids_first45.txt
+!data/qids_last45.txt
 results/
