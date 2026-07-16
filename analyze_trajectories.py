@@ -6,13 +6,21 @@
 (不是那個受限的沙箱)。輸出只有壓縮後的小陣列,可以再帶回沙箱做後續統計/畫圖。
 
 用法：
+  # 純量指標:每個位置的向量長度(L2 norm)——只看「量值」,不看方向
   python analyze_trajectories.py \
       --traces data/traces_Qwen3.5-4B_full.parquet \
       --s-labels data/s_correctness_qwen3.5-27b.parquet \
-      --queries data/queries.jsonl \
-      --layer -1 \
-      --n-resample 20 \
-      --out results/trajectories.json
+      --metric norm --layer -1 \
+      --out results/trajectories_norm.json
+
+  # 投影指標:把每個位置投影到 PCA 主成分方向上——保留方向資訊,比 norm 更有意義。
+  # 需要先跑 fit_pca_basis.py 從小的單一位置檔案擬合出 PCA 基底。
+  python analyze_trajectories.py \
+      --traces data/traces_Qwen3.5-4B_full.parquet \
+      --s-labels data/s_correctness_qwen3.5-27b.parquet \
+      --metric pca_projection --pca-basis data/pca_basis_layer_last.json \
+      --n-components 3 \
+      --out results/trajectories_pca.json
 """
 
 import argparse
@@ -41,17 +49,49 @@ def resample_trajectory(values: np.ndarray, n_points: int) -> np.ndarray:
     return np.interp(x_target, x_original, values)
 
 
+def project_onto_pca(vec: np.ndarray, pca_mean: np.ndarray, components: np.ndarray) -> np.ndarray:
+    """
+    把一個 hidden_dim 維的向量投影到 PCA 主成分方向上(先減去擬合時的平均值，
+    再跟每個主成分方向做內積)，回傳每個主成分上的投影值(shape: n_components)。
+    """
+    return (vec - pca_mean) @ components.T
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--traces", type=str, required=True)
     ap.add_argument("--s-labels", type=str, required=True)
-    ap.add_argument("--queries", type=str, required=True)
+    ap.add_argument("--metric", choices=["norm", "pca_projection"], default="norm",
+                     help="norm=每個位置的向量長度(只看量值)；"
+                          "pca_projection=投影到 PCA 主成分方向(保留方向資訊，"
+                          "需要 --pca-basis)")
+    ap.add_argument("--pca-basis", type=str, default=None,
+                     help="fit_pca_basis.py 產生的 PCA 基底檔(--metric pca_projection 時必填)")
+    ap.add_argument("--n-components", type=int, default=1,
+                     help="--metric pca_projection 時，要追蹤前幾個主成分(各自存一條軌跡)")
     ap.add_argument("--layer", type=int, default=-1,
-                     help="要看哪一層(0=embedding,1..32=transformer層,-1=最後一層)")
+                     help="要看哪一層(0=embedding,1..32=transformer層,-1=最後一層)。"
+                          "--metric pca_projection 時必須跟 PCA 基底擬合時用的層一致")
     ap.add_argument("--n-resample", type=int, default=20,
                      help="把每題軌跡內插成固定幾個點,方便跨題目比較/平均")
     ap.add_argument("--out", type=str, required=True)
     args = ap.parse_args()
+
+    pca_mean = pca_components = None
+    if args.metric == "pca_projection":
+        if not args.pca_basis:
+            print("[traj] --metric pca_projection 需要 --pca-basis", file=sys.stderr)
+            sys.exit(1)
+        with open(args.pca_basis, encoding="utf-8") as f:
+            basis = json.load(f)
+        if basis["layer"] != args.layer:
+            print(
+                f"[traj] 警告：PCA 基底是用 layer={basis['layer']} 擬合的，"
+                f"跟這次指定的 --layer {args.layer} 不一致，投影結果沒有意義",
+                file=sys.stderr,
+            )
+        pca_mean = np.array(basis["mean"], dtype=np.float32)
+        pca_components = np.array(basis["components"], dtype=np.float32)[: args.n_components]
 
     print("[traj] 載入 W 完整時序資料(這一步需要夠大的記憶體)...", file=sys.stderr)
     df_w = pd.read_parquet(args.traces)
@@ -70,7 +110,11 @@ def main():
 
     print(f"  W✗ 共 {len(df_w_wrong)} 題，共享難 {df_w_wrong['label'].sum()}，可救回 {(~df_w_wrong['label'].astype(bool)).sum()}", file=sys.stderr)
 
-    trajectories = {"shared_hard": [], "salvageable": []}
+    # metric="norm" 只有一條軌跡；metric="pca_projection" 每個主成分各一條，
+    # 用 component_0/component_1/... 當 key，兩種模式共用同一套分組/內插邏輯。
+    n_series = args.n_components if args.metric == "pca_projection" else 1
+    series_keys = [f"component_{k}" for k in range(n_series)] if args.metric == "pca_projection" else ["norm"]
+    trajectories = {key: {"shared_hard": [], "salvageable": []} for key in series_keys}
     raw_per_qid = {}
 
     for _, row in df_w_wrong.iterrows():
@@ -78,31 +122,43 @@ def main():
         hidden_by_pos = row["hidden_states_by_position"]  # list[seq_len][num_layers][hidden_dim]
         n_pos = len(hidden_by_pos)
 
-        # 對每個位置，抽出指定層、算 L2 norm，壓成一個純量
-        norms = np.empty(n_pos)
+        # 對每個位置，抽出指定層，依 --metric 壓成一個(或多個)純量
+        series_values = np.empty((n_series, n_pos))
         for i, layer_vecs in enumerate(hidden_by_pos):
             vec = np.array(layer_vecs[args.layer], dtype=np.float32)
-            norms[i] = np.linalg.norm(vec)
+            if args.metric == "pca_projection":
+                series_values[:, i] = project_onto_pca(vec, pca_mean, pca_components)
+            else:
+                series_values[0, i] = np.linalg.norm(vec)
 
-        resampled = resample_trajectory(norms, args.n_resample)
-        raw_per_qid[qid] = norms.tolist()
-
-        if row["label"] == 1:
-            trajectories["shared_hard"].append(resampled)
-        else:
-            trajectories["salvageable"].append(resampled)
+        raw_per_qid[qid] = series_values.tolist()
+        group = "shared_hard" if row["label"] == 1 else "salvageable"
+        for k, key in enumerate(series_keys):
+            resampled = resample_trajectory(series_values[k], args.n_resample)
+            trajectories[key][group].append(resampled)
 
         print(f"[traj] qid={qid} 處理完成 (seq_len={n_pos}, label={'共享難' if row['label']==1 else '可救回'})", file=sys.stderr)
 
+    series_results = {}
+    n_shared_hard = n_salvageable = 0
+    for key in series_keys:
+        sh = trajectories[key]["shared_hard"]
+        sv = trajectories[key]["salvageable"]
+        n_shared_hard, n_salvageable = len(sh), len(sv)
+        series_results[key] = {
+            "shared_hard_mean": np.mean(sh, axis=0).tolist() if sh else None,
+            "shared_hard_std": np.std(sh, axis=0).tolist() if sh else None,
+            "salvageable_mean": np.mean(sv, axis=0).tolist() if sv else None,
+            "salvageable_std": np.std(sv, axis=0).tolist() if sv else None,
+        }
+
     result = {
+        "metric": args.metric,
         "layer": args.layer,
         "n_resample": args.n_resample,
-        "shared_hard_mean": np.mean(trajectories["shared_hard"], axis=0).tolist() if trajectories["shared_hard"] else None,
-        "shared_hard_std": np.std(trajectories["shared_hard"], axis=0).tolist() if trajectories["shared_hard"] else None,
-        "shared_hard_n": len(trajectories["shared_hard"]),
-        "salvageable_mean": np.mean(trajectories["salvageable"], axis=0).tolist() if trajectories["salvageable"] else None,
-        "salvageable_std": np.std(trajectories["salvageable"], axis=0).tolist() if trajectories["salvageable"] else None,
-        "salvageable_n": len(trajectories["salvageable"]),
+        "shared_hard_n": n_shared_hard,
+        "salvageable_n": n_salvageable,
+        "series": series_results,  # {"norm": {...}} 或 {"component_0": {...}, "component_1": {...}, ...}
         "raw_per_qid": raw_per_qid,
     }
 
@@ -112,7 +168,7 @@ def main():
         json.dump(result, f, indent=2)
 
     print(f"[traj] 完成 → {out_path}", file=sys.stderr)
-    print(f"[traj] 共享難組: {result['shared_hard_n']} 題, 可救回組: {result['salvageable_n']} 題", file=sys.stderr)
+    print(f"[traj] 共享難組: {n_shared_hard} 題, 可救回組: {n_salvageable} 題", file=sys.stderr)
 
 
 if __name__ == "__main__":
