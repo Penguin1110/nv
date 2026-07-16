@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
 逐層掃描 decode-time hidden state 的可分性：每一層各自算「shared-hard vs
-salvageable」的 LOO-CV AUC，找出哪幾層帶最多訊號——回應「最後一層(為預測
+salvageable」的 leave-pair-out AUC，找出哪幾層帶最多訊號——回應「最後一層(為預測
 下一個 token 服務)未必是任務語意最明顯的層」這個問題。
 
 特徵做法(每層、每題)：把整條軌跡的 2560 維向量做平均(mean-pool)，
 另外算一份只用前 25% 生成進度的早期平均——不經過 PCA，避免「主成分只
 解釋 19% 變異」造成的資訊瓶頸。n 很小(約20題)、維度很高(2560)，所以
-用強正則化的 logistic regression + LOO-CV 拿誠實的估計。
+用強正則化的 logistic regression + leave-pair-out CV 拿誠實的估計。
 
 這是探索性掃描：33 層 x 2 種特徵 = 66 個 AUC，一定會有幾層因為運氣浮上來。
 所以結果只拿來「挑候選層」，之後要用另一半資料(first45)獨立驗證才算數。
@@ -29,7 +29,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import StandardScaler
 
 if sys.stdout.encoding is not None and sys.stdout.encoding.lower() != "utf-8":
@@ -38,16 +37,28 @@ if sys.stderr.encoding is not None and sys.stderr.encoding.lower() != "utf-8":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-def loo_auc(X, y, C=0.01):
-    """LOO-CV 的 AUC。C 預設壓很小(強正則化)，因為 n≈20、d=2560。"""
-    scores = np.empty(len(X))
-    for i in range(len(X)):
-        mask = np.ones(len(X), bool)
-        mask[i] = False
-        sc = StandardScaler().fit(X[mask])
-        clf = LogisticRegression(max_iter=2000, C=C).fit(sc.transform(X[mask]), y[mask])
-        scores[i] = clf.predict_proba(sc.transform(X[i : i + 1]))[0, 1]
-    return float(roc_auc_score(y, scores))
+def lpo_auc(X, y, C=0.01):
+    """
+    Leave-pair-out AUC：每次留「兩組各一題」出來測，訓練集永遠保持平衡。
+
+    為什麼不用 LOO：兩組 10/10 平衡時，LOO 留出一題會讓訓練集變 9 vs 10，
+    截距(base rate)系統性偏向另一組——被測的每一題都被偏向「不是它那組」，
+    強正則化下(係數趨近 0、預測被截距主導)AUC 會被機制性拖到遠低於 0.5，
+    實測整批層都掉到 0.1~0.2，那不是反向訊號，是評估偏差。
+    留一對出來訓練集就是 9 vs 9，沒有這個問題；AUC = 這一對排序正確的比例。
+    """
+    idx1 = np.where(y == 1)[0]
+    idx0 = np.where(y == 0)[0]
+    wins = 0.0
+    for i in idx1:
+        for j in idx0:
+            mask = np.ones(len(X), bool)
+            mask[i] = mask[j] = False
+            sc = StandardScaler().fit(X[mask])
+            clf = LogisticRegression(max_iter=2000, C=C).fit(sc.transform(X[mask]), y[mask])
+            si, sj = clf.decision_function(sc.transform(X[[i, j]]))
+            wins += 1.0 if si > sj else (0.5 if si == sj else 0.0)
+    return float(wins / (len(idx1) * len(idx0)))
 
 
 def main():
@@ -91,8 +102,8 @@ def main():
 
     results = []
     for l in range(n_layers):
-        auc_full = loo_auc(np.array(feats_full[l]), y, C=args.C)
-        auc_early = loo_auc(np.array(feats_early[l]), y, C=args.C)
+        auc_full = lpo_auc(np.array(feats_full[l]), y, C=args.C)
+        auc_early = lpo_auc(np.array(feats_early[l]), y, C=args.C)
         results.append({"layer": l, "auc_full_mean": auc_full, "auc_early_mean": auc_early})
         print(f"[scan] layer {l:2d}: AUC(全程平均)={auc_full:.3f}  AUC(早期平均)={auc_early:.3f}",
               file=sys.stderr)

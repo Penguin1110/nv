@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 逐(層 x 時間位置)探測 decode-time hidden state：在每個相對生成進度的切片上，
-用完整 2560 維向量訓練 LOO logistic probe、算 AUC，輸出「AUC 隨生成進度變化」
+用完整 2560 維向量訓練 logistic probe(leave-pair-out CV)、算 AUC，輸出「AUC 隨生成進度變化」
 的曲線(每層一條)。
 
 跟 scan_decode_layers.py(mean-pool，抹掉時序)的差別：這裡完全不做時間上的
@@ -31,7 +31,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import StandardScaler
 
 if sys.stdout.encoding is not None and sys.stdout.encoding.lower() != "utf-8":
@@ -40,15 +39,24 @@ if sys.stderr.encoding is not None and sys.stderr.encoding.lower() != "utf-8":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-def loo_auc(X, y, C=0.01):
-    scores = np.empty(len(X))
-    for i in range(len(X)):
-        mask = np.ones(len(X), bool)
-        mask[i] = False
-        sc = StandardScaler().fit(X[mask])
-        clf = LogisticRegression(max_iter=1000, C=C).fit(sc.transform(X[mask]), y[mask])
-        scores[i] = clf.predict_proba(sc.transform(X[i : i + 1]))[0, 1]
-    return float(roc_auc_score(y, scores))
+def lpo_auc(X, y, C=0.01):
+    """
+    Leave-pair-out AUC(每次留兩組各一題、訓練集保持 9v9 平衡)。
+    不用 LOO 的原因見 scan_decode_layers.py 的同名函式說明——LOO 在平衡小樣本
+    上會讓截距系統性偏向另一組，強正則化下 AUC 被機制性拖到遠低於 0.5。
+    """
+    idx1 = np.where(y == 1)[0]
+    idx0 = np.where(y == 0)[0]
+    wins = 0.0
+    for i in idx1:
+        for j in idx0:
+            mask = np.ones(len(X), bool)
+            mask[i] = mask[j] = False
+            sc = StandardScaler().fit(X[mask])
+            clf = LogisticRegression(max_iter=1000, C=C).fit(sc.transform(X[mask]), y[mask])
+            si, sj = clf.decision_function(sc.transform(X[[i, j]]))
+            wins += 1.0 if si > sj else (0.5 if si == sj else 0.0)
+    return float(wins / (len(idx1) * len(idx0)))
 
 
 def main():
@@ -102,7 +110,7 @@ def main():
         row_auc = []
         for p in range(n_pos):
             X = np.array(slices[l][p])
-            row_auc.append(loo_auc(X, y, C=args.C))
+            row_auc.append(lpo_auc(X, y, C=args.C))
         auc_matrix[l] = row_auc
         best_p = int(np.argmax(row_auc))
         print(f"[probe] layer {l:2d}: AUC range [{min(row_auc):.3f}, {max(row_auc):.3f}], "
