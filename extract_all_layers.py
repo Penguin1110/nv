@@ -24,6 +24,19 @@
       --out data/traces_Qwen3.5-4B.parquet \
       --answer-type numeric --max-new-tokens 8192 \
       --token-pos last --limit 30
+
+decode-time 軌跡（每生成一個 token 就抓一次 hidden state，不是 prompt 的
+prefill 位置）：加 --capture-decode-hidden。預設只存最後一層、只存前 200 個
+生成 token（早期軌跡才是要驗證的訊號；且逐步手動解碼會依 --max-decode-steps
+提前關閉 output_hidden_states，記憶體用量才不會隨長推理題的總生成長度膨脹，
+細節見 generate_with_decode_hidden 的說明）：
+  python extract_all_layers.py \
+      --model Qwen/Qwen3.5-4B \
+      --queries data/queries.jsonl \
+      --out data/traces_Qwen3.5-4B_decode.parquet \
+      --answer-type numeric --max-new-tokens 8192 \
+      --capture-decode-hidden --decode-layers -1 --max-decode-steps 200 \
+      --limit 1   # 先跑 1 題驗證，再跑全部
 """
 
 import argparse
@@ -75,6 +88,69 @@ def extract_numeric_answer(text):
     return numbers[-1] if numbers else None
 
 
+def generate_with_decode_hidden(model, tokenizer, inputs, max_new_tokens, decode_layer_spec, max_decode_steps):
+    """
+    手動逐步 greedy 解碼，只在還在 max_decode_steps 範圍內的步數才打開
+    output_hidden_states。
+
+    為什麼不直接用 model.generate(output_hidden_states=True)：transformers
+    會把「整個生成過程」每一步的 hidden state 都留在記憶體裡，即使之後只想存
+    前幾步，它還是得先把全部步數都攢住——AIME 這種長推理題常生成到上萬
+    token，這樣做記憶體風險很大。逐步手動跑可以在過了 max_decode_steps 之後
+    直接關掉 output_hidden_states，讓後續步數退回普通生成，記憶體用量跟
+    "只抓前 N 步" 的設定成正比，不會隨總生成長度線性膨脹。
+
+    代價：prompt 部分等於在這裡多跑一次 forward pass(第 0 步用完整
+    input_ids、use_cache=True 建立 KV cache)，跟檔案裡另一段專門存 prompt
+    position 的 prefill forward(use_cache=False)是各自獨立的兩次計算，
+    多花一點 GPU 時間換取兩段邏輯互不耦合、比較不容易出錯。
+    """
+    eos_id = tokenizer.eos_token_id
+    cur_ids = inputs["input_ids"]
+    cur_mask = inputs["attention_mask"]
+    past_key_values = None
+
+    generated_ids = []
+    decode_hidden_by_step = []
+    layer_idxs = None
+
+    for step in range(max_new_tokens):
+        want_hidden = (max_decode_steps is None) or (step < max_decode_steps)
+        with torch.no_grad():
+            out = model(
+                input_ids=cur_ids,
+                attention_mask=cur_mask,
+                past_key_values=past_key_values,
+                use_cache=True,
+                output_hidden_states=want_hidden,
+            )
+        past_key_values = out.past_key_values
+        next_id = out.logits[:, -1, :].argmax(dim=-1)
+
+        if want_hidden:
+            if layer_idxs is None:
+                n_layers_total = len(out.hidden_states)
+                layer_idxs = (
+                    list(range(n_layers_total)) if decode_layer_spec == "all"
+                    else [(n_layers_total + l if l < 0 else l) for l in decode_layer_spec]
+                )
+            decode_hidden_by_step.append([
+                out.hidden_states[l][0, -1].float().cpu().numpy().tolist() for l in layer_idxs
+            ])
+
+        token_id = next_id.item()
+        generated_ids.append(token_id)
+        if token_id == eos_id:
+            break
+
+        cur_ids = next_id.unsqueeze(0)
+        cur_mask = torch.cat(
+            [cur_mask, torch.ones((1, 1), dtype=cur_mask.dtype, device=cur_mask.device)], dim=1
+        )
+
+    return generated_ids, decode_hidden_by_step, (layer_idxs or [])
+
+
 def score_answer(generated_text: str, ground_truth: str, answer_type: str = "letter") -> int:
     if ground_truth is None:
         return 0
@@ -113,6 +189,20 @@ def main():
     ap.add_argument("--skip-generate", action="store_true",
                      help="不跑生成、不判對錯(標籤改由 benchmark 的 labels.parquet 提供時用這個);"
                           "只做 prefill forward 存 hidden state,速度快非常多")
+    ap.add_argument("--capture-decode-hidden", action="store_true",
+                     help="除了 prompt 的 prefill hidden state 之外，額外抓「生成階段每吐"
+                          "一個 token」的 hidden state(decode-time 軌跡，跟 prompt 的"
+                          "prefill 軌跡是不同的一段序列)。跟 --skip-generate 不相容")
+    ap.add_argument("--decode-layers", type=str, default="-1",
+                     help="decode 階段要存哪幾層(逗號分隔，例如 '-1' 或 '0,16,-1')，或傳"
+                          "'all' 存全部層。預設只存最後一層——長推理題可能生成到上萬"
+                          "token，存全部 33 層會讓檔案暴增")
+    ap.add_argument("--max-decode-steps", type=int, default=200,
+                     help="只存生成的前 N 個 token 的 decode hidden state(呼應「早期軌跡"
+                          "才是關鍵訊號」這個假設本身要驗證的東西);超過這個步數後仍會"
+                          "繼續生成、繼續判對錯，只是不再存 hidden state，記憶體用量才不會"
+                          "隨總生成長度線性膨脹。傳 0 或負數關閉上限、存全部步數(小心"
+                          "記憶體，見 generate_with_decode_hidden 的說明)")
     ap.add_argument("--answer-type", choices=["letter", "numeric"], default="letter",
                      help="letter=A-J 選擇題(預設)；numeric=整數答案(例如 AIME)")
     ap.add_argument("--apply-chat-template", action=argparse.BooleanOptionalAction, default=True,
@@ -135,13 +225,42 @@ def main():
                           "調大這個值中斷時會多丟掉最多這個數字的結果(而且是已經花"
                           "GPU 時間算出來的)——沒有特別理由不建議調大")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--num-shards", type=int, default=1,
+                     help="要切成幾份分給幾台機器平行跑(每台各跑各的 GPU，互不衝突)。"
+                          "搭配 --shard-index 使用；每台機器用同一個 --queries、"
+                          "同樣的 --num-shards，只有 --shard-index 跟 --out 不同，"
+                          "事後再把幾個 --out 檔案 concat 起來合併")
+    ap.add_argument("--shard-index", type=int, default=0,
+                     help="這台機器要跑第幾份(0-indexed，範圍 0..num-shards-1)")
     ap.add_argument("--dtype", choices=["bf16", "fp16"], default="bf16")
     args = ap.parse_args()
+
+    if args.num_shards > 1 and not (0 <= args.shard_index < args.num_shards):
+        print(f"[錯誤] --shard-index 必須在 0..{args.num_shards - 1} 範圍內", file=sys.stderr)
+        sys.exit(1)
 
     if args.answer_type == "numeric" and args.max_new_tokens == 8:
         print(
             "[警告] --answer-type numeric 但 --max-new-tokens 還是預設值 8，"
             "長推理題大機率還沒推到答案就被截斷，建議加 --max-new-tokens 1024 以上",
+            file=sys.stderr,
+        )
+
+    if args.skip_generate and args.capture_decode_hidden:
+        print("[錯誤] --capture-decode-hidden 需要實際生成文字，不能跟 --skip-generate 一起用", file=sys.stderr)
+        sys.exit(1)
+
+    decode_layer_spec = None
+    max_decode_steps = None
+    if args.capture_decode_hidden:
+        decode_layer_spec = (
+            "all" if args.decode_layers.strip().lower() == "all"
+            else [int(x) for x in args.decode_layers.split(",")]
+        )
+        max_decode_steps = args.max_decode_steps if args.max_decode_steps > 0 else None
+        print(
+            f"[extract_all] decode-time hidden state 模式：層={decode_layer_spec}，"
+            f"前 {max_decode_steps if max_decode_steps is not None else '(不限，注意記憶體)'} 個生成 token",
             file=sys.stderr,
         )
 
@@ -171,6 +290,14 @@ def main():
     with open(args.queries, "r", encoding="utf-8") as f:
         for line in f:
             queries.append(json.loads(line))
+
+    if args.num_shards > 1:
+        queries = [q for idx, q in enumerate(queries) if idx % args.num_shards == args.shard_index]
+        print(
+            f"[extract_all] shard {args.shard_index}/{args.num_shards}：分到 {len(queries)} 題",
+            file=sys.stderr,
+        )
+
     if args.limit is not None:
         queries = queries[: args.limit]
 
@@ -248,8 +375,17 @@ def main():
                     available_positions = None
                     hidden_by_position = None
 
+                decode_hidden_by_step = decode_layers_captured = generated_ids = None
                 if args.skip_generate:
                     gen_text, correct, hit_max_new_tokens, n_new_tokens = "", None, None, None
+                elif args.capture_decode_hidden:
+                    generated_ids, decode_hidden_by_step, decode_layers_captured = generate_with_decode_hidden(
+                        model, tokenizer, inputs, args.max_new_tokens, decode_layer_spec, max_decode_steps,
+                    )
+                    n_new_tokens = len(generated_ids)
+                    hit_max_new_tokens = (n_new_tokens >= args.max_new_tokens)
+                    gen_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+                    correct = score_answer(gen_text, item["ground_truth"], args.answer_type)
                 else:
                     with torch.no_grad():
                         # 明確傳入 eos_token_id：這個模型的 config.json/generation_config.json
@@ -293,11 +429,19 @@ def main():
                 else:
                     row["token_pos"] = args.token_pos
                     row["hidden_all_layers"] = layer_vecs  # list[num_layers+1][hidden_dim]
+                if args.capture_decode_hidden:
+                    row["decode_hidden_states_by_step"] = decode_hidden_by_step
+                    row["decode_layers_captured"] = decode_layers_captured
+                    row["n_decode_steps_captured"] = len(decode_hidden_by_step)
+                    row["generated_token_ids"] = generated_ids
                 buffer_rows.append(row)
+                decode_note = (
+                    f", decode步數存={len(decode_hidden_by_step)}" if args.capture_decode_hidden else ""
+                )
                 print(
                     f"[extract_all] [{i+1}/{n_total}] qid={item['qid']} 完成 "
                     f"(耗時 {time.time()-t0:.1f}s, seq_len={seq_len}, correct={correct}, "
-                    f"新生成token數={n_new_tokens}, 是否被截斷={hit_max_new_tokens})",
+                    f"新生成token數={n_new_tokens}, 是否被截斷={hit_max_new_tokens}{decode_note})",
                     file=sys.stderr,
                 )
             except Exception as e:  # noqa: BLE001

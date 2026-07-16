@@ -1,26 +1,43 @@
 """
-把 data/traces_Qwen3.5-4B_full.parquet 的完整時序 hidden state 壓縮成
-「每個 token 位置一個代表數值」的軌跡，依 W✗S✗(共享難) vs W✗S✓(可救回) 分組比較。
+把 hidden state 壓縮成「每個位置一個代表數值」的軌跡，依 W✗S✗(共享難) vs
+W✗S✓(可救回) 分組比較。支援兩種軌跡來源(--source)：
 
-因為這個檔案很大(單一 row group,17GB+ 解碼需求),必須在記憶體夠大的機器上跑
-(不是那個受限的沙箱)。輸出只有壓縮後的小陣列,可以再帶回沙箱做後續統計/畫圖。
+  prefill = data/traces_Qwen3.5-4B_full.parquet 的完整時序 hidden state，
+            位置軸是 prompt 裡的 token 位置(模型「讀題」的軌跡)。這個檔案
+            很大(單一 row group,17GB+ 解碼需求),必須在記憶體夠大的機器上
+            跑(不是那個受限的沙箱)。
+  decode  = extract_all_layers.py --capture-decode-hidden 產生的檔案，位置軸
+            是「生成的第幾個 token」(模型「答題」的軌跡)——這才是「回答過程
+            中的 hidden state 軌跡」實際指的東西，跟 prefill 是不同的位置軸、
+            不同的資料分布，兩者的 PCA 基底不能共用(見 fit_pca_basis.py)。
+            這個檔案通常小很多(預設只存前 200 步、最後一層),沙箱也跑得動。
+
+輸出只有壓縮後的小陣列,可以再帶回沙箱做後續統計/畫圖。
 
 用法：
   # 純量指標:每個位置的向量長度(L2 norm)——只看「量值」,不看方向
   python analyze_trajectories.py \
-      --traces data/traces_Qwen3.5-4B_full.parquet \
+      --traces data/traces_Qwen3.5-4B_full.parquet --source prefill \
       --s-labels data/s_correctness_qwen3.5-27b.parquet \
       --metric norm --layer -1 \
       --out results/trajectories_norm.json
 
   # 投影指標:把每個位置投影到 PCA 主成分方向上——保留方向資訊,比 norm 更有意義。
-  # 需要先跑 fit_pca_basis.py 從小的單一位置檔案擬合出 PCA 基底。
+  # 需要先跑 fit_pca_basis.py 用同一種 --source 擬合出 PCA 基底。
   python analyze_trajectories.py \
-      --traces data/traces_Qwen3.5-4B_full.parquet \
+      --traces data/traces_Qwen3.5-4B_full.parquet --source prefill \
       --s-labels data/s_correctness_qwen3.5-27b.parquet \
       --metric pca_projection --pca-basis data/pca_basis_layer_last.json \
       --n-components 3 \
       --out results/trajectories_pca.json
+
+  # decode-time 版本(回答過程中的軌跡)：
+  python analyze_trajectories.py \
+      --traces data/traces_Qwen3.5-4B_decode.parquet --source decode \
+      --s-labels data/s_correctness_qwen3.5-27b.parquet \
+      --metric pca_projection --pca-basis data/pca_basis_decode_layer_last.json \
+      --n-components 3 \
+      --out results/trajectories_decode_pca.json
 """
 
 import argparse
@@ -57,9 +74,31 @@ def project_onto_pca(vec: np.ndarray, pca_mean: np.ndarray, components: np.ndarr
     return (vec - pca_mean) @ components.T
 
 
+def resolve_captured_layer_index(captured_layers, num_layers_total, want_layer):
+    """
+    decode 模式只存了選定的幾層(見 extract_all_layers.py --decode-layers)，不是
+    完整的 0..num_layers_total-1，所以「第 want_layer 層」在
+    decode_hidden_states_by_step[step] 這個 list 裡的實際 index，要用
+    decode_layers_captured 這欄反查——不能直接拿 want_layer 當 index 用。
+    """
+    want_idx = num_layers_total + want_layer if want_layer < 0 else want_layer
+    resolved = [num_layers_total + l if l < 0 else l for l in captured_layers]
+    if want_idx not in resolved:
+        raise ValueError(
+            f"要分析的層 {want_layer}(解析後絕對層數 {want_idx})不在這個檔案實際存的 "
+            f"decode_layers_captured={captured_layers} 之中"
+        )
+    return resolved.index(want_idx)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--traces", type=str, required=True)
+    ap.add_argument("--source", choices=["prefill", "decode"], default="prefill",
+                     help="prefill=軌跡的位置軸是 prompt token 位置(讀題階段)；"
+                          "decode=軌跡的位置軸是生成的第幾個 token(答題階段)，"
+                          "讀 extract_all_layers.py --capture-decode-hidden 產生的檔案。"
+                          "PCA 基底必須用同一種 --source 擬合，兩者的向量分布不能混用")
     ap.add_argument("--s-labels", type=str, required=True)
     ap.add_argument("--metric", choices=["norm", "pca_projection"], default="norm",
                      help="norm=每個位置的向量長度(只看量值)；"
@@ -90,10 +129,17 @@ def main():
                 f"跟這次指定的 --layer {args.layer} 不一致，投影結果沒有意義",
                 file=sys.stderr,
             )
+        if basis.get("source", "prefill") != args.source:
+            print(
+                f"[traj] 警告：PCA 基底是用 --source {basis.get('source', 'prefill')} 擬合的，"
+                f"跟這次指定的 --source {args.source} 不一致，prefill(讀題)跟"
+                f"decode(答題)的向量分布不同，投影結果沒有意義",
+                file=sys.stderr,
+            )
         pca_mean = np.array(basis["mean"], dtype=np.float32)
         pca_components = np.array(basis["components"], dtype=np.float32)[: args.n_components]
 
-    print("[traj] 載入 W 完整時序資料(這一步需要夠大的記憶體)...", file=sys.stderr)
+    print(f"[traj] 載入 W 軌跡資料(--source {args.source}，這一步需要夠大的記憶體)...", file=sys.stderr)
     df_w = pd.read_parquet(args.traces)
     print(f"  → {len(df_w)} 題", file=sys.stderr)
 
@@ -119,13 +165,24 @@ def main():
 
     for _, row in df_w_wrong.iterrows():
         qid = row["qid"]
-        hidden_by_pos = row["hidden_states_by_position"]  # list[seq_len][num_layers][hidden_dim]
+        if args.source == "decode":
+            hidden_by_pos = row["decode_hidden_states_by_step"]  # list[n_steps][n_captured_layers][hidden_dim]
+            if not hidden_by_pos:
+                print(f"[traj] 警告：qid={qid} 沒有存到任何 decode hidden state，跳過", file=sys.stderr)
+                continue
+            layer_idx = resolve_captured_layer_index(
+                row["decode_layers_captured"], row["num_layers_incl_embed"], args.layer
+            )
+            get_vec = lambda step_layers: np.array(step_layers[layer_idx], dtype=np.float32)  # noqa: E731
+        else:
+            hidden_by_pos = row["hidden_states_by_position"]  # list[seq_len][num_layers][hidden_dim]
+            get_vec = lambda layer_vecs: np.array(layer_vecs[args.layer], dtype=np.float32)  # noqa: E731
         n_pos = len(hidden_by_pos)
 
         # 對每個位置，抽出指定層，依 --metric 壓成一個(或多個)純量
         series_values = np.empty((n_series, n_pos))
         for i, layer_vecs in enumerate(hidden_by_pos):
-            vec = np.array(layer_vecs[args.layer], dtype=np.float32)
+            vec = get_vec(layer_vecs)
             if args.metric == "pca_projection":
                 series_values[:, i] = project_onto_pca(vec, pca_mean, pca_components)
             else:
@@ -153,6 +210,7 @@ def main():
         }
 
     result = {
+        "source": args.source,
         "metric": args.metric,
         "layer": args.layer,
         "n_resample": args.n_resample,
