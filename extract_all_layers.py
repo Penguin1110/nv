@@ -274,6 +274,11 @@ def main():
                           "調大這個值中斷時會多丟掉最多這個數字的結果(而且是已經花"
                           "GPU 時間算出來的)——沒有特別理由不建議調大")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--qids-file", type=str, default=None,
+                     help="只跑這個檔案裡列出的 qid(一行一個)，其餘題目直接略過。"
+                          "適合分機器時要跑「特定一批題目」而不是均分(例如把 W✗S✗ 跟 "
+                          "W✗S✓ 兩組分給不同機器)；跟 --num-shards/--shard-index 是"
+                          "不同的篩選方式，兩者可以疊加(先照 qid 篩，再切 shard)")
     ap.add_argument("--num-shards", type=int, default=1,
                      help="要切成幾份分給幾台機器平行跑(每台各跑各的 GPU，互不衝突)。"
                           "搭配 --shard-index 使用；每台機器用同一個 --queries、"
@@ -343,6 +348,17 @@ def main():
     with open(args.queries, "r", encoding="utf-8") as f:
         for line in f:
             queries.append(json.loads(line))
+
+    if args.qids_file:
+        with open(args.qids_file, "r", encoding="utf-8") as f:
+            wanted_qids = {line.strip() for line in f if line.strip()}
+        n_before_qids = len(queries)
+        queries = [q for q in queries if q["qid"] in wanted_qids]
+        print(
+            f"[extract_all] --qids-file 篩選：{args.queries} 的 {n_before_qids} 題中"
+            f"符合的有 {len(queries)} 題(qids-file 裡列了 {len(wanted_qids)} 個)",
+            file=sys.stderr,
+        )
 
     if args.num_shards > 1:
         queries = [q for idx, q in enumerate(queries) if idx % args.num_shards == args.shard_index]

@@ -18,4 +18,6 @@ data/*
 !data/s_correctness_qwen3.5-27b.parquet
 !data/s_correctness_qwen3.5-9b.parquet
 !data/pca_basis_layer_last.json
+!data/qids_shared_hard.txt
+!data/qids_salvageable.txt
 results/
