@@ -54,14 +54,21 @@ if sys.stderr.encoding is not None and sys.stderr.encoding.lower() != "utf-8":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-def resample_trajectory(values: np.ndarray, n_points: int) -> np.ndarray:
+def resample_trajectory(values: np.ndarray, n_points: int, x_original: np.ndarray = None) -> np.ndarray:
     """
     把長度不一的軌跡(每題 seq_len 不同)線性內插成固定長度 n_points，
-    這樣不同題目的軌跡才能疊在一起算平均/畫圖。x 軸視為 0~100% 的相對位置。
+    這樣不同題目的軌跡才能疊在一起算平均/畫圖。
+
+    x_original 是每個取樣點實際對應的相對位置(0~1)。不傳的話假設取樣點是均勻
+    分布(prefill 模式、或 decode 模式沒有 stride/cap 時成立)；decode 模式若用了
+    --decode-stride 又被 --max-decode-samples 提前截斷，取樣筆數就不能代表真正
+    的生成進度，這時必須傳入用 decode_step_indices / n_new_tokens 算出的實際
+    相對位置，不然不同題目的軌跡會對不齊。
     """
     if len(values) == 1:
         return np.full(n_points, values[0])
-    x_original = np.linspace(0, 1, len(values))
+    if x_original is None:
+        x_original = np.linspace(0, 1, len(values))
     x_target = np.linspace(0, 1, n_points)
     return np.interp(x_target, x_original, values)
 
@@ -165,6 +172,7 @@ def main():
 
     for _, row in df_w_wrong.iterrows():
         qid = row["qid"]
+        x_original = None  # None = 假設均勻分布；decode 模式視情況覆寫成實際相對位置
         if args.source == "decode":
             hidden_by_pos = row["decode_hidden_states_by_step"]  # list[n_steps][n_captured_layers][hidden_dim]
             if not hidden_by_pos:
@@ -174,6 +182,13 @@ def main():
                 row["decode_layers_captured"], row["num_layers_incl_embed"], args.layer
             )
             get_vec = lambda step_layers: np.array(step_layers[layer_idx], dtype=np.float32)  # noqa: E731
+            # 取樣筆數不能代表真正的生成進度(有 --decode-stride 間隔、可能被
+            # --max-decode-samples 提前截斷)，要用實際 step index 除以生成總長
+            # 換算相對位置，不然不同題目的軌跡在 resample 時會對不齊。
+            n_new_tokens = row.get("n_new_tokens")
+            step_indices = row.get("decode_step_indices")
+            if step_indices is not None and n_new_tokens and n_new_tokens > 1:
+                x_original = np.array(step_indices, dtype=np.float64) / (n_new_tokens - 1)
         else:
             hidden_by_pos = row["hidden_states_by_position"]  # list[seq_len][num_layers][hidden_dim]
             get_vec = lambda layer_vecs: np.array(layer_vecs[args.layer], dtype=np.float32)  # noqa: E731
@@ -191,7 +206,7 @@ def main():
         raw_per_qid[qid] = series_values.tolist()
         group = "shared_hard" if row["label"] == 1 else "salvageable"
         for k, key in enumerate(series_keys):
-            resampled = resample_trajectory(series_values[k], args.n_resample)
+            resampled = resample_trajectory(series_values[k], args.n_resample, x_original)
             trajectories[key][group].append(resampled)
 
         print(f"[traj] qid={qid} 處理完成 (seq_len={n_pos}, label={'共享難' if row['label']==1 else '可救回'})", file=sys.stderr)

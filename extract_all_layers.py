@@ -26,16 +26,27 @@
       --token-pos last --limit 30
 
 decode-time 軌跡（每生成一個 token 就抓一次 hidden state，不是 prompt 的
-prefill 位置）：加 --capture-decode-hidden。預設只存最後一層、只存前 200 個
-生成 token（早期軌跡才是要驗證的訊號；且逐步手動解碼會依 --max-decode-steps
-提前關閉 output_hidden_states，記憶體用量才不會隨長推理題的總生成長度膨脹，
-細節見 generate_with_decode_hidden 的說明）：
+prefill 位置）：加 --capture-decode-hidden。預設只存最後一層、只存前 200 筆
+（--decode-stride 1、--max-decode-samples 200，等於只看生成開頭一小段）：
   python extract_all_layers.py \
       --model Qwen/Qwen3.5-4B \
       --queries data/queries.jsonl \
       --out data/traces_Qwen3.5-4B_decode.parquet \
       --answer-type numeric --max-new-tokens 8192 \
-      --capture-decode-hidden --decode-layers -1 --max-decode-steps 200 \
+      --capture-decode-hidden --decode-layers -1 --max-decode-samples 200 \
+      --limit 1   # 先跑 1 題驗證，再跑全部
+
+想涵蓋「整個生成過程」（不只開頭）又要存全部層時，用 --decode-stride 拉大
+取樣間隔取代硬性只存前 N 筆——例如 20000 token 上限、全部 33 層、每 100 步
+取一次，每題約 68MB（33 層 x 200 筆 x hidden_dim x 4 bytes），90 題約 6GB，
+比每步都存、只存前 200 步(只看得到開頭)划算得多：
+  python extract_all_layers.py \
+      --model Qwen/Qwen3.5-4B \
+      --queries data/queries.jsonl \
+      --out data/traces_Qwen3.5-4B_decode.parquet \
+      --answer-type numeric --max-new-tokens 20000 \
+      --capture-decode-hidden --decode-layers all \
+      --decode-stride 100 --max-decode-samples 0 \
       --limit 1   # 先跑 1 題驗證，再跑全部
 """
 
@@ -88,17 +99,27 @@ def extract_numeric_answer(text):
     return numbers[-1] if numbers else None
 
 
-def generate_with_decode_hidden(model, tokenizer, inputs, max_new_tokens, decode_layer_spec, max_decode_steps):
+def generate_with_decode_hidden(model, tokenizer, inputs, max_new_tokens, decode_layer_spec,
+                                 decode_stride=1, max_decode_samples=None):
     """
-    手動逐步 greedy 解碼，只在還在 max_decode_steps 範圍內的步數才打開
-    output_hidden_states。
+    手動逐步 greedy 解碼，只在「取樣到」的步數才打開 output_hidden_states。
 
     為什麼不直接用 model.generate(output_hidden_states=True)：transformers
     會把「整個生成過程」每一步的 hidden state 都留在記憶體裡，即使之後只想存
-    前幾步，它還是得先把全部步數都攢住——AIME 這種長推理題常生成到上萬
-    token，這樣做記憶體風險很大。逐步手動跑可以在過了 max_decode_steps 之後
-    直接關掉 output_hidden_states，讓後續步數退回普通生成，記憶體用量跟
-    "只抓前 N 步" 的設定成正比，不會隨總生成長度線性膨脹。
+    一部分，它還是得先把全部步數都攢住——AIME 這種長推理題常生成到上萬
+    token、又想存全部層時，這樣做記憶體/硬碟都會爆。逐步手動跑可以只在
+    取樣到的步數才打開 output_hidden_states，其餘步數退回普通生成。
+
+    decode_stride：每隔幾步取樣一次(1=每步都存)。想涵蓋「整個生成過程」又要
+    存全部層時，把這個調大(例如 50)取代硬性只存前 N 步——這樣才能同時看到
+    推理早期、中期、晚期的軌跡，而不是只看得到開頭一小段。
+    max_decode_samples：取樣後最多存幾筆(不是原始 step 數，是取樣完的筆數)；
+    超過後仍會繼續生成、繼續判對錯，只是不再存 hidden state。None/不設代表
+    取樣涵蓋整個生成過程，不論生成多長。
+
+    回傳的 decode_step_indices 記錄每一筆取樣「對應到生成的第幾個 token」——
+    downstream 分析要算「相對生成進度」時，必須用這個而不是取樣筆數本身
+    (取樣筆數如果被 max_decode_samples 提前截斷，筆數跟實際生成進度就不成比例)。
 
     代價：prompt 部分等於在這裡多跑一次 forward pass(第 0 步用完整
     input_ids、use_cache=True 建立 KV cache)，跟檔案裡另一段專門存 prompt
@@ -112,10 +133,14 @@ def generate_with_decode_hidden(model, tokenizer, inputs, max_new_tokens, decode
 
     generated_ids = []
     decode_hidden_by_step = []
+    decode_step_indices = []
     layer_idxs = None
+    n_samples = 0
 
     for step in range(max_new_tokens):
-        want_hidden = (max_decode_steps is None) or (step < max_decode_steps)
+        is_stride_hit = (step % decode_stride == 0)
+        under_cap = (max_decode_samples is None) or (n_samples < max_decode_samples)
+        want_hidden = is_stride_hit and under_cap
         with torch.no_grad():
             out = model(
                 input_ids=cur_ids,
@@ -137,6 +162,8 @@ def generate_with_decode_hidden(model, tokenizer, inputs, max_new_tokens, decode
             decode_hidden_by_step.append([
                 out.hidden_states[l][0, -1].float().cpu().numpy().tolist() for l in layer_idxs
             ])
+            decode_step_indices.append(step)
+            n_samples += 1
 
         token_id = next_id.item()
         generated_ids.append(token_id)
@@ -148,7 +175,7 @@ def generate_with_decode_hidden(model, tokenizer, inputs, max_new_tokens, decode
             [cur_mask, torch.ones((1, 1), dtype=cur_mask.dtype, device=cur_mask.device)], dim=1
         )
 
-    return generated_ids, decode_hidden_by_step, (layer_idxs or [])
+    return generated_ids, decode_hidden_by_step, decode_step_indices, (layer_idxs or [])
 
 
 def score_answer(generated_text: str, ground_truth: str, answer_type: str = "letter") -> int:
@@ -196,13 +223,19 @@ def main():
     ap.add_argument("--decode-layers", type=str, default="-1",
                      help="decode 階段要存哪幾層(逗號分隔，例如 '-1' 或 '0,16,-1')，或傳"
                           "'all' 存全部層。預設只存最後一層——長推理題可能生成到上萬"
-                          "token，存全部 33 層會讓檔案暴增")
-    ap.add_argument("--max-decode-steps", type=int, default=200,
-                     help="只存生成的前 N 個 token 的 decode hidden state(呼應「早期軌跡"
-                          "才是關鍵訊號」這個假設本身要驗證的東西);超過這個步數後仍會"
-                          "繼續生成、繼續判對錯，只是不再存 hidden state，記憶體用量才不會"
-                          "隨總生成長度線性膨脹。傳 0 或負數關閉上限、存全部步數(小心"
-                          "記憶體，見 generate_with_decode_hidden 的說明)")
+                          "token，存全部 33 層會讓檔案暴增，搭配 --decode-stride 拉大"
+                          "取樣間隔才控制得住檔案大小")
+    ap.add_argument("--decode-stride", type=int, default=1,
+                     help="每隔幾個生成 token 取樣一次 decode hidden state(預設 1=每個"
+                          "都存)。想涵蓋『整個生成過程』又要存全部層時，把這個調大"
+                          "(例如 50 或 100)取代只存前 N 步——用稀疏取樣涵蓋全長，"
+                          "才看得到推理早期/中期/晚期，而不是只看得到開頭一小段")
+    ap.add_argument("--max-decode-samples", type=int, default=200,
+                     help="取樣後最多存幾筆(是取樣完的筆數，不是原始 step 數);超過這個"
+                          "數量後仍會繼續生成、繼續判對錯，只是不再存 hidden state。傳 0 "
+                          "或負數關閉上限，取樣涵蓋整個生成過程不論多長(存全部層時務必"
+                          "配大一點的 --decode-stride，不然檔案會爆——例如 20000 token、"
+                          "全部 33 層、stride=100 大約每題 68MB；stride=1 會是這個的 100 倍)")
     ap.add_argument("--answer-type", choices=["letter", "numeric"], default="letter",
                      help="letter=A-J 選擇題(預設)；numeric=整數答案(例如 AIME)")
     ap.add_argument("--apply-chat-template", action=argparse.BooleanOptionalAction, default=True,
@@ -251,16 +284,20 @@ def main():
         sys.exit(1)
 
     decode_layer_spec = None
-    max_decode_steps = None
+    max_decode_samples = None
     if args.capture_decode_hidden:
+        if args.decode_stride < 1:
+            print("[錯誤] --decode-stride 至少要是 1", file=sys.stderr)
+            sys.exit(1)
         decode_layer_spec = (
             "all" if args.decode_layers.strip().lower() == "all"
             else [int(x) for x in args.decode_layers.split(",")]
         )
-        max_decode_steps = args.max_decode_steps if args.max_decode_steps > 0 else None
+        max_decode_samples = args.max_decode_samples if args.max_decode_samples > 0 else None
         print(
             f"[extract_all] decode-time hidden state 模式：層={decode_layer_spec}，"
-            f"前 {max_decode_steps if max_decode_steps is not None else '(不限，注意記憶體)'} 個生成 token",
+            f"每 {args.decode_stride} 步取樣一次，最多"
+            f"{max_decode_samples if max_decode_samples is not None else '(不限，注意檔案大小)'} 筆",
             file=sys.stderr,
         )
 
@@ -375,12 +412,15 @@ def main():
                     available_positions = None
                     hidden_by_position = None
 
-                decode_hidden_by_step = decode_layers_captured = generated_ids = None
+                decode_hidden_by_step = decode_step_indices = decode_layers_captured = generated_ids = None
                 if args.skip_generate:
                     gen_text, correct, hit_max_new_tokens, n_new_tokens = "", None, None, None
                 elif args.capture_decode_hidden:
-                    generated_ids, decode_hidden_by_step, decode_layers_captured = generate_with_decode_hidden(
-                        model, tokenizer, inputs, args.max_new_tokens, decode_layer_spec, max_decode_steps,
+                    generated_ids, decode_hidden_by_step, decode_step_indices, decode_layers_captured = (
+                        generate_with_decode_hidden(
+                            model, tokenizer, inputs, args.max_new_tokens, decode_layer_spec,
+                            args.decode_stride, max_decode_samples,
+                        )
                     )
                     n_new_tokens = len(generated_ids)
                     hit_max_new_tokens = (n_new_tokens >= args.max_new_tokens)
@@ -431,12 +471,17 @@ def main():
                     row["hidden_all_layers"] = layer_vecs  # list[num_layers+1][hidden_dim]
                 if args.capture_decode_hidden:
                     row["decode_hidden_states_by_step"] = decode_hidden_by_step
+                    # 每一筆對應到生成的第幾個 token(0-indexed)——因為有 --decode-stride
+                    # 取樣間隔、又可能被 --max-decode-samples 提前截斷，筆數本身不能
+                    # 代表「相對生成進度」，分析時要用這欄位除以 n_new_tokens 換算。
+                    row["decode_step_indices"] = decode_step_indices
                     row["decode_layers_captured"] = decode_layers_captured
-                    row["n_decode_steps_captured"] = len(decode_hidden_by_step)
+                    row["decode_stride"] = args.decode_stride
+                    row["n_decode_samples_captured"] = len(decode_hidden_by_step)
                     row["generated_token_ids"] = generated_ids
                 buffer_rows.append(row)
                 decode_note = (
-                    f", decode步數存={len(decode_hidden_by_step)}" if args.capture_decode_hidden else ""
+                    f", decode取樣筆數={len(decode_hidden_by_step)}" if args.capture_decode_hidden else ""
                 )
                 print(
                     f"[extract_all] [{i+1}/{n_total}] qid={item['qid']} 完成 "
