@@ -175,7 +175,8 @@ def main():
         x_original = None  # None = 假設均勻分布；decode 模式視情況覆寫成實際相對位置
         if args.source == "decode":
             hidden_by_pos = row["decode_hidden_states_by_step"]  # list[n_steps][n_captured_layers][hidden_dim]
-            if not hidden_by_pos:
+            # parquet 讀回來是 numpy 陣列，`if not arr` 會炸 ambiguous truth value，用長度判斷
+            if len(hidden_by_pos) == 0:
                 print(f"[traj] 警告：qid={qid} 沒有存到任何 decode hidden state，跳過", file=sys.stderr)
                 continue
             layer_idx = resolve_captured_layer_index(
