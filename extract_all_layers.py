@@ -14,6 +14,12 @@
 可續跑（含 Ctrl+C）：已經在輸出檔裡的 qid 會自動跳過，不重跑；每完成一題就立刻
 寫入磁碟（--flush-every 預設 1），單題常要好幾分鐘 GPU 時間，不會因為中斷而丟失。
 
+--capture-decode-hidden 模式下單題可能要跑到上萬 token、好幾分鐘，如果 Ctrl+C
+發生在單題生成「中途」，這一題目前為止已生成的 token/已取樣的 hidden state 會
+存成 interrupted=True 的一列（不計入 correct），不會整題憑空消失；重跑同一個
+指令時這種列會被清掉、那一題會整題重新跑（見 generate_with_decode_hidden 的
+Ctrl+C 說明）。
+
 ⚠️ 已在真實 GPU 機器上驗證過能跑（Qwen3.5-4B），且需要 --apply-chat-template
    （預設開）才會照指令回答，不然會亂生成到 --max-new-tokens 上限。
 
@@ -125,6 +131,12 @@ def generate_with_decode_hidden(model, tokenizer, inputs, max_new_tokens, decode
     input_ids、use_cache=True 建立 KV cache)，跟檔案裡另一段專門存 prompt
     position 的 prefill forward(use_cache=False)是各自獨立的兩次計算，
     多花一點 GPU 時間換取兩段邏輯互不耦合、比較不容易出錯。
+
+    Ctrl+C 安全：單題現在可能要生成上萬 token、跑好幾分鐘，如果中斷發生在
+    generate() 中間，外層的 --flush-every 只保得住「已經完整跑完的前幾題」，
+    這一題已經花掉的 GPU 時間會整個不見。這裡在迴圈內接住 KeyboardInterrupt，
+    把目前為止已經生成的 token/已經取樣的 hidden state 都回傳(用
+    was_interrupted=True 標記)，呼叫端存成這一題的「不完整」列，而不是整個丟掉。
     """
     eos_id = tokenizer.eos_token_id
     cur_ids = inputs["input_ids"]
@@ -136,46 +148,50 @@ def generate_with_decode_hidden(model, tokenizer, inputs, max_new_tokens, decode
     decode_step_indices = []
     layer_idxs = None
     n_samples = 0
+    was_interrupted = False
 
-    for step in range(max_new_tokens):
-        is_stride_hit = (step % decode_stride == 0)
-        under_cap = (max_decode_samples is None) or (n_samples < max_decode_samples)
-        want_hidden = is_stride_hit and under_cap
-        with torch.no_grad():
-            out = model(
-                input_ids=cur_ids,
-                attention_mask=cur_mask,
-                past_key_values=past_key_values,
-                use_cache=True,
-                output_hidden_states=want_hidden,
-            )
-        past_key_values = out.past_key_values
-        next_id = out.logits[:, -1, :].argmax(dim=-1)
-
-        if want_hidden:
-            if layer_idxs is None:
-                n_layers_total = len(out.hidden_states)
-                layer_idxs = (
-                    list(range(n_layers_total)) if decode_layer_spec == "all"
-                    else [(n_layers_total + l if l < 0 else l) for l in decode_layer_spec]
+    try:
+        for step in range(max_new_tokens):
+            is_stride_hit = (step % decode_stride == 0)
+            under_cap = (max_decode_samples is None) or (n_samples < max_decode_samples)
+            want_hidden = is_stride_hit and under_cap
+            with torch.no_grad():
+                out = model(
+                    input_ids=cur_ids,
+                    attention_mask=cur_mask,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                    output_hidden_states=want_hidden,
                 )
-            decode_hidden_by_step.append([
-                out.hidden_states[l][0, -1].float().cpu().numpy().tolist() for l in layer_idxs
-            ])
-            decode_step_indices.append(step)
-            n_samples += 1
+            past_key_values = out.past_key_values
+            next_id = out.logits[:, -1, :].argmax(dim=-1)
 
-        token_id = next_id.item()
-        generated_ids.append(token_id)
-        if token_id == eos_id:
-            break
+            if want_hidden:
+                if layer_idxs is None:
+                    n_layers_total = len(out.hidden_states)
+                    layer_idxs = (
+                        list(range(n_layers_total)) if decode_layer_spec == "all"
+                        else [(n_layers_total + l if l < 0 else l) for l in decode_layer_spec]
+                    )
+                decode_hidden_by_step.append([
+                    out.hidden_states[l][0, -1].float().cpu().numpy().tolist() for l in layer_idxs
+                ])
+                decode_step_indices.append(step)
+                n_samples += 1
 
-        cur_ids = next_id.unsqueeze(0)
-        cur_mask = torch.cat(
-            [cur_mask, torch.ones((1, 1), dtype=cur_mask.dtype, device=cur_mask.device)], dim=1
-        )
+            token_id = next_id.item()
+            generated_ids.append(token_id)
+            if token_id == eos_id:
+                break
 
-    return generated_ids, decode_hidden_by_step, decode_step_indices, (layer_idxs or [])
+            cur_ids = next_id.unsqueeze(0)
+            cur_mask = torch.cat(
+                [cur_mask, torch.ones((1, 1), dtype=cur_mask.dtype, device=cur_mask.device)], dim=1
+            )
+    except KeyboardInterrupt:
+        was_interrupted = True
+
+    return generated_ids, decode_hidden_by_step, decode_step_indices, (layer_idxs or []), was_interrupted
 
 
 def score_answer(generated_text: str, ground_truth: str, answer_type: str = "letter") -> int:
@@ -345,7 +361,29 @@ def main():
     # 中斷後重打全部太浪費)。
     if out_path.exists():
         import pandas as pd
-        done_qids = set(pd.read_parquet(out_path, columns=["qid"])["qid"])
+        try:
+            light = pd.read_parquet(out_path, columns=["qid", "interrupted"])
+            has_interrupted_col = True
+        except (KeyError, ValueError):
+            light = pd.read_parquet(out_path, columns=["qid"])
+            has_interrupted_col = False
+
+        if has_interrupted_col and light["interrupted"].fillna(False).any():
+            # 上次是 Ctrl+C 中斷時留下的不完整列，要從檔案裡清掉再重新跑這幾題，
+            # 不然這題會同時有一列不完整的舊資料、一列完整的新資料，qid 重複。
+            n_interrupted = int(light["interrupted"].fillna(False).sum())
+            full = pd.read_parquet(out_path)
+            full = full[~full["interrupted"].fillna(False)]
+            full.to_parquet(out_path)
+            print(
+                f"[extract_all] 清掉 {n_interrupted} 筆先前中斷時留下的不完整結果，"
+                f"這些題目會重新跑",
+                file=sys.stderr,
+            )
+            done_qids = set(full["qid"])
+        else:
+            done_qids = set(light["qid"])
+
         n_before = len(queries)
         queries = [q for q in queries if q["qid"] not in done_qids]
         if n_before != len(queries):
@@ -413,19 +451,23 @@ def main():
                     hidden_by_position = None
 
                 decode_hidden_by_step = decode_step_indices = decode_layers_captured = generated_ids = None
+                was_interrupted = False
                 if args.skip_generate:
                     gen_text, correct, hit_max_new_tokens, n_new_tokens = "", None, None, None
                 elif args.capture_decode_hidden:
-                    generated_ids, decode_hidden_by_step, decode_step_indices, decode_layers_captured = (
+                    generated_ids, decode_hidden_by_step, decode_step_indices, decode_layers_captured, was_interrupted = (
                         generate_with_decode_hidden(
                             model, tokenizer, inputs, args.max_new_tokens, decode_layer_spec,
                             args.decode_stride, max_decode_samples,
                         )
                     )
                     n_new_tokens = len(generated_ids)
-                    hit_max_new_tokens = (n_new_tokens >= args.max_new_tokens)
+                    hit_max_new_tokens = (n_new_tokens >= args.max_new_tokens) and not was_interrupted
                     gen_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-                    correct = score_answer(gen_text, item["ground_truth"], args.answer_type)
+                    # 被 Ctrl+C 中斷的話文字/hidden state 都只跑到一半，不能拿去判對錯，
+                    # 用 None 標記(跟 --skip-generate 的「還沒判」共用同一個語意)，
+                    # row["interrupted"]=True 會讓下次重跑時不把這題當成已完成而跳過。
+                    correct = None if was_interrupted else score_answer(gen_text, item["ground_truth"], args.answer_type)
                 else:
                     with torch.no_grad():
                         # 明確傳入 eos_token_id：這個模型的 config.json/generation_config.json
@@ -452,6 +494,10 @@ def main():
                     "raw_generation": gen_text,
                     "n_new_tokens": n_new_tokens,
                     "hit_max_new_tokens": hit_max_new_tokens,
+                    # True 代表這一列是 Ctrl+C 中斷時的部分結果(只有 decode-hidden 模式
+                    # 會發生)，不是真的跑完；重跑同一個指令時這題會被視為未完成、重新跑，
+                    # 不會被 resume 邏輯誤判成已經做完而跳過。
+                    "interrupted": was_interrupted,
                 }
                 if extract_all_positions or token_positions is not None:
                     if not available_positions:
@@ -480,6 +526,18 @@ def main():
                     row["n_decode_samples_captured"] = len(decode_hidden_by_step)
                     row["generated_token_ids"] = generated_ids
                 buffer_rows.append(row)
+
+                if was_interrupted:
+                    flush(buffer_rows)
+                    print(
+                        f"\n[extract_all] 使用者中斷(Ctrl+C)，發生在 qid={item['qid']} 生成到一半"
+                        f"(已生成 {n_new_tokens} token、取樣 {len(decode_hidden_by_step or [])} 筆"
+                        f"hidden state)——這一題的部分結果已存成 interrupted=True，"
+                        f"重跑同一個指令會把這題當成未完成、重新從頭跑這一題",
+                        file=sys.stderr,
+                    )
+                    sys.exit(130)
+
                 decode_note = (
                     f", decode取樣筆數={len(decode_hidden_by_step)}" if args.capture_decode_hidden else ""
                 )
