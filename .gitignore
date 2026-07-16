@@ -17,4 +17,5 @@ data/*
 !data/queries.jsonl
 !data/s_correctness_qwen3.5-27b.parquet
 !data/s_correctness_qwen3.5-9b.parquet
+!data/pca_basis_layer_last.json
 results/

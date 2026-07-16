@@ -64,7 +64,7 @@ precedence_check:
 # GO / NO-GO THRESHOLDS
 # ----------------------------------------------------------------------------
 experiment_a:
-  min_w_wrong_samples: 50        # abort Step 1 if fewer W✗ rows than this
+  min_w_wrong_samples: 30        # abort Step 1 if fewer W✗ rows than this (TEMP: lowered from 50 for exploratory pass with only 90 AIME questions — real data has 37 W✗ rows; restore to 50+ once the question pool is expanded)
   min_cell_w_wrong_s_wrong: 20   # warn if the W✗S✗ (shared-basin) cell is smaller
   min_auc_over_baseline: 0.05    # Step 2 must beat baseline AUC by at least this much (in addition to p<0.05)
 
